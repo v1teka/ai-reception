@@ -1,0 +1,8 @@
+{
+  "name": "ai-reception-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Демо AI-администратора 24/7 для салона красоты и фитнес-клуба",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}

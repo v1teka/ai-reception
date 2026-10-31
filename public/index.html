@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Онлайн-администратор 24/7</title>
+<style>
+  :root {
+    --bg: #eef1f5; --panel: #fff; --text: #1d2330; --muted: #7a8394;
+    --accent: #8b5cf6; --accent-2: #ec4899; --me: #8b5cf6; --me-text: #fff; --bot: #fff;
+  }
+  body.fitness { --accent: #f97316; --accent-2: #ef4444; --me: #f97316; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); display: flex; justify-content: center;
+  }
+  .app { width: 100%; max-width: 480px; height: 100dvh; display: flex; flex-direction: column; background: #f6f7fb; box-shadow: 0 0 40px rgba(0,0,0,.08); }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; color: #fff;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+  .ava { width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,.25); display: grid; place-items: center; font-size: 22px; position: relative; flex: none; }
+  .ava::after { content: ""; position: absolute; right: 1px; bottom: 1px; width: 11px; height: 11px; border-radius: 50%; background: #22c55e; border: 2px solid #fff; }
+  .title { font-weight: 600; }
+  .sub { font-size: 13px; opacity: .9; }
+  #log { flex: 1; overflow-y: auto; padding: 16px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .msg { max-width: 82%; padding: 9px 13px; border-radius: 18px; white-space: pre-wrap; word-wrap: break-word; animation: pop .18s ease-out; }
+  .bot { align-self: flex-start; background: var(--bot); border-bottom-left-radius: 6px; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+  .me { align-self: flex-end; background: var(--me); color: var(--me-text); border-bottom-right-radius: 6px; }
+  .time { display: block; font-size: 11px; opacity: .55; margin-top: 2px; text-align: right; }
+  .typing { display: inline-flex; gap: 4px; padding: 13px 14px; }
+  .typing i { width: 7px; height: 7px; border-radius: 50%; background: #b5bcc8; animation: blink 1.2s infinite; }
+  .typing i:nth-child(2) { animation-delay: .2s; } .typing i:nth-child(3) { animation-delay: .4s; }
+  #quick { display: flex; gap: 8px; padding: 0 12px 8px; overflow-x: auto; scrollbar-width: none; }
+  #quick button { flex: none; border: 1px solid var(--accent); color: var(--accent); background: #fff; border-radius: 16px; padding: 6px 12px; font-size: 14px; cursor: pointer; }
+  form { display: flex; gap: 8px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); background: #fff; border-top: 1px solid #e6e8ee; }
+  input { flex: 1; border: 1px solid #dfe3ea; border-radius: 22px; padding: 11px 16px; font-size: 16px; outline: none; }
+  input:focus { border-color: var(--accent); }
+  form button { width: 44px; height: 44px; border: 0; border-radius: 50%; background: var(--accent); color: #fff; font-size: 18px; cursor: pointer; flex: none; }
+  form button:disabled { opacity: .5; }
+  .switch { text-align: center; font-size: 12px; color: var(--muted); padding: 6px; }
+  .switch a { color: var(--accent); }
+  @keyframes blink { 0%, 80%, 100% { opacity: .3 } 40% { opacity: 1 } }
+  @keyframes pop { from { transform: translateY(4px); opacity: 0 } }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="ava" id="ava">💬</div>
+    <div><div class="title" id="title">Загрузка…</div><div class="sub" id="sub">онлайн</div></div>
+  </header>
+  <div id="log"></div>
+  <div id="quick"></div>
+  <form id="form">
+    <input id="input" placeholder="Напишите сообщение…" autocomplete="off" />
+    <button aria-label="Отправить">➤</button>
+  </form>
+  <div class="switch">Демо · <a href="?b=salon">Салон красоты</a> · <a href="?b=fitness">Фитнес-клуб</a></div>
+</div>
+<script>
+  const business = new URLSearchParams(location.search).get("b") === "fitness" ? "fitness" : "salon";
+  document.body.classList.add(business);
+  const log = document.getElementById("log"), form = document.getElementById("form"),
+        input = document.getElementById("input"), quick = document.getElementById("quick");
+  const history = [];
+  let busy = false;
+
+  const now = () => new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function add(role, text) {
+    const el = document.createElement("div");
+    el.className = "msg " + (role === "user" ? "me" : "bot");
+    el.textContent = text;
+    const t = document.createElement("span"); t.className = "time"; t.textContent = now();
+    el.appendChild(t);
+    log.appendChild(el);
+    log.scrollTop = log.scrollHeight;
+  }
+  function typing(on) {
+    let el = document.getElementById("typing");
+    if (on && !el) {
+      el = document.createElement("div"); el.id = "typing"; el.className = "msg bot typing";
+      el.innerHTML = "<i></i><i></i><i></i>"; log.appendChild(el); log.scrollTop = log.scrollHeight;
+    } else if (!on && el) el.remove();
+  }
+
+  async function send(text) {
+    text = text.trim();
+    if (!text || busy) return;
+    busy = true; quick.innerHTML = ""; input.value = "";
+    add("user", text);
+    history.push({ role: "user", content: text });
+    await sleep(500);
+    typing(true);
+    const started = Date.now();
+    let reply;
+    try {
+      const r = await fetch("/api/chat", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ business, messages: history }),
+      });
+      const data = await r.json();
+      reply = data.reply || data.error;
+      if (data.reply) history.push({ role: "assistant", content: data.reply });
+      else history.pop();
+    } catch {
+      reply = "Ой, связь подвела 🙈 Напишите ещё раз, пожалуйста";
+      history.pop();
+    }
+    // Небольшая «человеческая» пауза, чтобы ответ не прилетал мгновенно
+    const wait = Math.min(2500, 600 + reply.length * 20) - (Date.now() - started);
+    if (wait > 0) await sleep(wait);
+    typing(false);
+    add("assistant", reply);
+    busy = false;
+    input.focus();
+  }
+
+  form.addEventListener("submit", (e) => { e.preventDefault(); send(input.value); });
+
+  fetch("/api/config?b=" + business).then((r) => r.json()).then((c) => {
+    document.title = c.title + " — чат";
+    document.getElementById("title").textContent = c.title;
+    document.getElementById("sub").textContent = c.subtitle;
+    document.getElementById("ava").textContent = c.avatar;
+    setTimeout(() => {
+      add("assistant", c.greeting);
+      history.push({ role: "assistant", content: c.greeting });
+      for (const q of c.quickReplies) {
+        const b = document.createElement("button"); b.type = "button"; b.textContent = q;
+        b.onclick = () => send(q); quick.appendChild(b);
+      }
+    }, 400);
+  });
+</script>
+</body>
+</html>
