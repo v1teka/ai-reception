@@ -1,0 +1,60 @@
+name: Test and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm test
+
+      - name: Smoke test web chat
+        run: |
+          node server.js > server.log 2>&1 &
+          for i in $(seq 1 20); do curl -fs -o /dev/null http://127.0.0.1:3000/api/config && break; sleep 0.5; done
+          curl -fsS -o /dev/null http://127.0.0.1:3000/ || { cat server.log; exit 1; }
+          curl -fsS "http://127.0.0.1:3000/api/config?b=salon" | grep -q '"id":"salon"'
+          curl -fsS "http://127.0.0.1:3000/api/config?b=fitness" | grep -q '"id":"fitness"'
+
+  deploy:
+    name: Deploy
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Выкладки идут по одной; из ожидающих остаётся только самая свежая
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    steps:
+      # Сервер сам забирает этот коммит из GitHub, собирает образ Telegram-бота из Dockerfile,
+      # перезапускает его, проверяет, что бот запустился, и при сбое откатывается.
+      # Ключ на сервере умеет только «deploy <SHA>».
+      - name: Deploy via SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          SSH_TARGET: ${{ secrets.DEPLOY_TARGET }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+            "$SSH_TARGET" "deploy $GITHUB_SHA"

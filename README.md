@@ -88,6 +88,12 @@ docker build -t barber-bot .
 docker run -d --restart=always --env-file .env -v $(pwd)/data:/app/data barber-bot
 ```
 
+### Автодеплой на свой сервер
+
+Push в `main` → GitHub Actions ([`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)): `npm test` и проверка запуска веб-чата, затем сервер по SSH получает команду выложить этот коммит. Сервер сам забирает его из GitHub, собирает образ из `Dockerfile`, перезапускает бота и ждёт в логе «Бот @… запущен»; если бот не поднялся — откатывается на предыдущую рабочую версию. Ручной запуск — Actions → Test and Deploy → Run workflow.
+
+Секреты репозитория: `DEPLOY_SSH_KEY` (ключ, которому на сервере разрешена только выкладка), `DEPLOY_KNOWN_HOSTS` (ключ хоста), `DEPLOY_TARGET` (`пользователь@хост`).
+
 ## Панель мастера
 
 Команды: `/panel`, `/chats`, `/bookings`, `/settings`, `/help`.
