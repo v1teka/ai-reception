@@ -1,0 +1,45 @@
+const crypto = require("crypto");
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Экранирование для parse_mode=HTML в Telegram
+function esc(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function truncate(s, n) {
+  s = String(s ?? "");
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+function randomCode(bytes = 6) {
+  return crypto.randomBytes(bytes).toString("base64url");
+}
+
+// Детерминированный псевдослучайный генератор (для демо-занятости)
+function seededRandom(seed) {
+  let h = crypto.createHash("sha256").update(seed).digest().readUInt32LE(0) || 1;
+  return () => {
+    h ^= h << 13;
+    h >>>= 0;
+    h ^= h >> 17;
+    h ^= h << 5;
+    h >>>= 0;
+    return h / 4294967296;
+  };
+}
+
+function clamp(n, min, max) {
+  return Math.min(max, Math.max(min, n));
+}
+
+function userName(u) {
+  if (!u) return "Клиент";
+  const name = [u.first_name, u.last_name].filter(Boolean).join(" ").trim();
+  return name || (u.username ? "@" + u.username : "Клиент");
+}
+
+module.exports = { sleep, esc, truncate, randomCode, seededRandom, clamp, userName };
