@@ -2,7 +2,16 @@
   "name": "ai-reception-demo",
   "version": "1.0.0",
   "private": true,
-  "description": "Демо AI-администратора 24/7 для салона красоты и фитнес-клуба",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" }
+  "description": "Демо AI-администратора 24/7: веб-чат для салона и Telegram-бот для барбершопа",
+  "scripts": {
+    "start": "node server.js",
+    "bot": "node bot/index.js",
+    "test": "node --test --test-concurrency=1 test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.5.0"
+  }
 }
