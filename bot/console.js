@@ -2,10 +2,11 @@
 // настройки точки (Яндекс.Карты, правки словами, знания), приглашение мастера.
 const { esc, truncate, randomCode, userName } = require("./util");
 const { nowParts, fmtTime, fmtDate, fmtDateRelative, addDays, ago } = require("./time");
-const { upcomingBookings, bookingLabel, cancelBooking, freeStarts } = require("./schedule");
+const { upcomingBookings, bookingLabel, freeStarts } = require("./schedule");
 const { renderSummary, renderFull, demoShop, emptyShop, serviceLine } = require("./shop");
 const { importFromYandex, updateFromMessage, noteFromImages } = require("./setup");
 const { extractYandexUrl } = require("./yandex");
+const { importFromYclients, parseCompanyId } = require("./yclients");
 
 const DAY = 86400000;
 const btn = (text, data) => ({ text, callback_data: data });
@@ -219,6 +220,7 @@ const methods = {
         } · ${esc(b.staffName)} · ${b.id}`
       );
     }
+    if (this.shop.yclients) lines.push("", "<i>Здесь записи, которые сделал бот. Полное расписание салона — в YCLIENTS.</i>");
     const kb = list.slice(0, 10).map((b) => [btn(`❌ ${b.id} · ${fmtTime(b.start)} ${truncate(b.client?.name || "", 20)}`, `b:cx:${b.id}`)]);
     kb.push(BACK);
     return this.show(adminId, chunks(lines.join("\n"))[0], kb, cq);
@@ -226,6 +228,7 @@ const methods = {
 
   async showSlots(adminId, cq) {
     const shop = this.shop;
+    if (shop.yclients) return this.showYclientsSlots(adminId, cq);
     const today = nowParts(shop.timezone, this.now()).date;
     const lines = [`🕐 <b>Свободное время</b> (слот ${shop.slotMinutes} мин)`];
     for (const date of [today, addDays(today, 1)]) {
@@ -239,8 +242,32 @@ const methods = {
     return this.show(adminId, chunks(lines.join("\n"))[0], [BACK], cq);
   },
 
+  // Свободное время из YCLIENTS — на самую короткую услугу, сегодня и завтра
+  async showYclientsSlots(adminId, cq) {
+    const shop = this.shop;
+    const service = [...shop.services].filter((s) => s.ycId).sort((a, b) => (a.durationMin || a.slots) - (b.durationMin || b.slots))[0];
+    const lines = ["🕐 <b>Свободное время</b> (из YCLIENTS)"];
+    if (!service) {
+      lines.push("", "Нет услуг, связанных с YCLIENTS. Обновите данные в «Настройки точки» → YCLIENTS.");
+      return this.show(adminId, lines.join("\n"), [BACK], cq);
+    }
+    const today = nowParts(shop.timezone, this.now()).date;
+    const r = await this.backend().freeSlots({ serviceId: service.id, dateFrom: today, days: 2, now: this.now(), maxPerDay: 30 });
+    if (r.error) {
+      lines.push("", `😕 ${esc(r.error.replace(/ ?Не называй.*$/, ""))}`);
+      return this.show(adminId, lines.join("\n"), [BACK], cq);
+    }
+    lines.push(`на услугу «${esc(service.name)}»`);
+    for (const day of r.days) {
+      lines.push("", `<b>${esc(day.label)}</b>`);
+      if (!day.staff.length) lines.push(day.closed ? "нет записи" : "нет свободного времени");
+      for (const st of day.staff) lines.push(`${esc(st.name)}: ${st.times.join(", ")}${st.more ? ` и ещё ${st.more}` : ""}`);
+    }
+    return this.show(adminId, chunks(lines.join("\n"))[0], [BACK], cq);
+  },
+
   async adminCancelBooking(adminId, id) {
-    const r = cancelBooking(this.state, id, { by: "admin", now: this.now() });
+    const r = await this.backend().cancel(id, { by: "admin", now: this.now() });
     if (!r.ok) return this.consoleApi.sendMessage(adminId, r.error);
     const b = r.booking;
     const today = nowParts(this.shop.timezone, this.now()).date;
@@ -271,8 +298,9 @@ const methods = {
       [btn("🗺 Загрузить с Яндекс.Карт", "s:yandex")],
       [btn("✏️ Изменить словами или фото", "s:edit")],
       [btn("📚 Знания", "s:kn"), btn("📋 Всё целиком", "s:all")],
-      [btn(`⏱ Слот: ${s.slotMinutes} мин`, "s:slot"), btn(`🎲 Демо-занятость: ${s.demoBusy ? "вкл" : "выкл"}`, "s:busy")],
+      [btn(s.yclients ? "🔗 YCLIENTS: подключено" : "🔗 Подключить YCLIENTS", "s:yc")],
     ];
+    if (!s.yclients) kb.push([btn(`⏱ Слот: ${s.slotMinutes} мин`, "s:slot"), btn(`🎲 Демо-занятость: ${s.demoBusy ? "вкл" : "выкл"}`, "s:busy")]);
     if (this.role(adminId) === "owner") kb.push([btn("🧹 Сбросить точку", "s:reset")]);
     kb.push(BACK);
     return this.show(adminId, lines.join("\n"), kb, cq);
@@ -355,6 +383,16 @@ const methods = {
       return this.showKnowledge(adminId);
     }
 
+    if (a.mode === "await_yclients") {
+      const companyId = parseCompanyId(text);
+      if (!companyId) {
+        return say("Не нашёл ID компании. Пришлите число (ID филиала в YCLIENTS) или ссылку на виджет онлайн-записи, например n123456.yclients.com/company/987654.", [
+          [btn("❌ Отменить", "s:cancel")],
+        ]);
+      }
+      return this.loadFromYclients(adminId, companyId);
+    }
+
     const url = extractYandexUrl(text);
     if (url) {
       await say("⏳ Загружаю карточку с Яндекс.Карт и разбираю услуги… Обычно это до минуты.");
@@ -381,6 +419,45 @@ const methods = {
     return this.showPreview(adminId, r.shop, r.changes);
   },
 
+  async loadFromYclients(adminId, companyId) {
+    const a = this.admin(adminId);
+    const say = (t, kb) => this.sendHtml(adminId, t, kb ? { reply_markup: { inline_keyboard: kb } } : {});
+    await say("⏳ Загружаю услуги и мастеров из YCLIENTS…");
+    const r = await importFromYclients({ api: this.yclients, companyId, prevShop: this.shop, log: this.log });
+    if (!r.ok) {
+      return say(`😕 Не получилось подключить YCLIENTS: ${esc(r.reason)}.\n\nПроверьте ID и пришлите ещё раз.`, [[btn("❌ Отменить", "s:cancel")]]);
+    }
+    this.setMode(a, "review", { pending: r.shop, freshBase: false });
+    return this.showPreview(adminId, r.shop, r.changes);
+  },
+
+  async showYclients(adminId, cq) {
+    const s = this.shop;
+    const lines = ["🔗 <b>YCLIENTS</b>", ""];
+    const kb = [];
+    if (s.yclients) {
+      lines.push(
+        `Подключена компания <b>${esc(s.yclients.title || s.yclients.companyId)}</b> (ID ${esc(s.yclients.companyId)}).`,
+        "Бот берёт свободное время из YCLIENTS и записывает клиентов прямо в журнал. Отмена через бота удаляет запись и в YCLIENTS.",
+        "",
+        "Если в YCLIENTS поменялись услуги, цены или мастера — нажмите «Обновить»."
+      );
+      kb.push([btn("🔄 Обновить из YCLIENTS", "s:ycsync")]);
+      kb.push([btn("🔌 Отключить YCLIENTS", "s:ycoff")]);
+    } else {
+      lines.push(
+        "Если салон ведёт запись в YCLIENTS, бот может работать с его расписанием: показывать реальное свободное время и записывать клиентов прямо в журнал YCLIENTS.",
+        "",
+        "Понадобится ID компании (филиала) в YCLIENTS: он есть в ссылке на виджет онлайн-записи или в настройках филиала.",
+        "Также в YCLIENTS должна быть включена онлайн-запись для нужных услуг и мастеров и выключено подтверждение записи по SMS-коду."
+      );
+      if (!this.yclients) lines.push("", "⚠️ Сначала владелец бота должен указать ключ партнёра YCLIENTS в настройках сервера (YCLIENTS_PARTNER_TOKEN).");
+      else kb.push([btn("🔗 Подключить", "s:ycon")]);
+    }
+    kb.push([btn("◀️ Настройки", "m:settings")]);
+    return this.show(adminId, lines.join("\n"), kb, cq);
+  },
+
   async onSettingsAction(adminId, act, arg, cq) {
     const a = this.admin(adminId);
     const say = (t, kb) => this.sendHtml(adminId, t, kb ? { reply_markup: { inline_keyboard: kb } } : {});
@@ -398,6 +475,32 @@ const methods = {
           "✏️ Напишите, что изменить или что боту нужно знать. Можно прислать фото прайса или скриншоты.\n\nНапример:\n• «по воскресеньям выходной»\n• «стрижка теперь 2000 ₽, длится час»\n• «добавь услугу укладка 700 ₽ на 30 минут»\n• «есть парковка во дворе, оплата только картой»",
           cancelKb
         );
+      case "yc":
+        return this.showYclients(adminId, cq);
+      case "ycon":
+        if (!this.yclients) return this.showYclients(adminId, cq);
+        this.setMode(a, "await_yclients", { pending: null, freshBase: false });
+        return say(
+          "🔗 Пришлите ID компании (филиала) в YCLIENTS или ссылку на виджет онлайн-записи, например <code>n123456.yclients.com/company/987654</code>.\n\nЯ загружу услуги, цены и мастеров, покажу, что получилось, и сохраню после подтверждения.",
+          cancelKb
+        );
+      case "ycsync":
+        if (!this.shop.yclients) return this.showYclients(adminId, cq);
+        return this.loadFromYclients(adminId, this.shop.yclients.companyId);
+      case "ycoff":
+        if (!this.shop.yclients) return this.showYclients(adminId, cq);
+        return this.show(
+          adminId,
+          "🔌 <b>Отключить YCLIENTS?</b>\nБот перестанет брать время из YCLIENTS и будет вести расписание сам по графику точки. Уже созданные записи в YCLIENTS останутся.",
+          [[btn("Да, отключить", "s:ycoff2"), btn("Нет", "s:yc")]],
+          cq
+        );
+      case "ycoff2": {
+        const { yclients, ...rest } = this.shop;
+        this.state.shop = { ...rest, updatedAt: this.now() };
+        this.save();
+        return this.showSettings(adminId, cq);
+      }
       case "kn":
         return this.showKnowledge(adminId, cq);
       case "kadd":

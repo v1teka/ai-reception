@@ -70,6 +70,7 @@ function emptyShop(prev) {
     staff: [],
     services: [],
     knowledge: [],
+    yclients: prev?.yclients,
   });
 }
 
@@ -126,10 +127,11 @@ function normalizeShop(raw, prev) {
       .map((s) => (typeof s === "string" ? { name: s } : s))
       .filter((s) => s && str(s.name))
       .slice(0, 20)
-      .map((s) => ({ id: s.id || null, name: str(s.name, 60) })),
+      .map((s) => ({ id: s.id || null, name: str(s.name, 60), ...ycIdOf(s) })),
     prev?.staff,
     "m"
   );
+  inheritYcIds(staff, prev?.staff);
   if (!staff.length) staff.push({ id: "m1", name: "Мастер" });
 
   const services = assignIds(
@@ -140,17 +142,21 @@ function normalizeShop(raw, prev) {
         let slots = int(s.slots, 0);
         const dur = int(s.duration_minutes ?? s.durationMinutes, 0);
         if (slots < 1 && dur > 0) slots = Math.ceil(dur / slotMinutes);
+        const durationMin = int(s.durationMin, 0);
         return {
           id: s.id || null,
           name: str(s.name, 100),
           price: str(String(s.price ?? ""), 40),
           slots: clamp(slots || 1, 1, 12),
           description: str(s.description, 300),
+          ...(durationMin > 0 ? { durationMin: clamp(durationMin, 5, 24 * 60) } : {}),
+          ...ycIdOf(s),
         };
       }),
     prev?.services,
     "s"
   );
+  inheritYcIds(services, prev?.services);
 
   const knowledge = (Array.isArray(raw.knowledge) ? raw.knowledge : [])
     .map((k) => (typeof k === "string" ? { text: k } : k))
@@ -190,8 +196,38 @@ function normalizeShop(raw, prev) {
     staff,
     services,
     knowledge,
+    ...(raw.yclients?.companyId ? { yclients: normYclients(raw.yclients) } : {}),
     updatedAt: raw.updatedAt || Date.now(),
   };
+}
+
+// Связь с YCLIENTS: id услуги/мастера в YCLIENTS хранится рядом с нашим id
+function ycIdOf(item) {
+  return item && item.ycId != null && /^\d+$/.test(String(item.ycId)) ? { ycId: String(item.ycId) } : {};
+}
+
+// Правка словами или импорт не знают про ycId — берём его у прежнего элемента с тем же id
+function inheritYcIds(items, prevItems) {
+  const prevById = new Map((prevItems || []).map((x) => [x.id, x]));
+  for (const it of items) {
+    const p = prevById.get(it.id);
+    if (!it.ycId && p?.ycId && p.name?.toLowerCase() === it.name.toLowerCase()) it.ycId = p.ycId;
+    if (it.durationMin === undefined && p?.durationMin && p.name?.toLowerCase() === it.name.toLowerCase() && it.slots === p.slots) {
+      it.durationMin = p.durationMin;
+    }
+  }
+}
+
+function normYclients(y) {
+  return {
+    companyId: String(y.companyId).replace(/\D/g, ""),
+    title: str(y.title, 120),
+    syncedAt: Number(y.syncedAt) || Date.now(),
+  };
+}
+
+function serviceMinutes(shop, s) {
+  return s.durationMin || s.slots * shop.slotMinutes;
 }
 
 // ---------- Формат для LLM (импорт и правки словами) ----------
@@ -282,7 +318,7 @@ function toLlmShop(shop) {
     services: shop.services.map((s) => ({
       name: s.name,
       price: s.price,
-      duration_minutes: s.slots * shop.slotMinutes,
+      duration_minutes: serviceMinutes(shop, s),
       slots: s.slots,
       description: s.description,
     })),
@@ -335,9 +371,9 @@ function hoursLines(shop) {
 }
 
 function serviceLine(shop, s, withId) {
-  const dur = fmtDuration(s.slots * shop.slotMinutes);
-  const slots = `${s.slots} ${s.slots === 1 ? "слот" : s.slots < 5 ? "слота" : "слотов"}`;
-  return `${withId ? `[${s.id}] ` : ""}${s.name} — ${s.price || "цена не указана"} — ${dur} (${slots})${
+  const dur = fmtDuration(serviceMinutes(shop, s));
+  const slots = shop.yclients ? "" : ` (${s.slots} ${s.slots === 1 ? "слот" : s.slots < 5 ? "слота" : "слотов"})`;
+  return `${withId ? `[${s.id}] ` : ""}${s.name} — ${s.price || "цена не указана"} — ${dur}${slots}${
     s.description ? `. ${s.description}` : ""
   }`;
 }
@@ -351,10 +387,18 @@ function renderForPrompt(shop) {
   if (shop.phone) lines.push(`Телефон: ${shop.phone}`);
   if (shop.site) lines.push(`Сайт: ${shop.site}`);
   if (shop.yandexUrl) lines.push(`Яндекс.Карты: ${shop.yandexUrl}`);
-  lines.push(`График работы: ${hoursLines(shop).join("; ")}`);
-  lines.push(
-    `Запись: слот ${shop.slotMinutes} мин; записываем минимум за ${fmtDuration(shop.minLeadMinutes || 0)} и не дальше чем на ${shop.bookingDays} дн вперёд.`
-  );
+  const hasHours = Object.values(shop.hours).some(Boolean);
+  if (shop.yclients) {
+    if (hasHours) lines.push(`График работы: ${hoursLines(shop).join("; ")}`);
+    lines.push(
+      "Запись ведётся в YCLIENTS: рабочие дни, свободное время и длительность услуг узнавай только через get_free_slots. Для записи обязательно нужен номер телефона клиента — без него запись не пройдёт, попроси его вежливо."
+    );
+  } else {
+    lines.push(`График работы: ${hoursLines(shop).join("; ")}`);
+    lines.push(
+      `Запись: слот ${shop.slotMinutes} мин; записываем минимум за ${fmtDuration(shop.minLeadMinutes || 0)} и не дальше чем на ${shop.bookingDays} дн вперёд.`
+    );
+  }
   lines.push(`Мастера: ${shop.staff.map((s) => `${s.name} [${s.id}]`).join(", ")}`);
   lines.push("");
   lines.push("Услуги (id — название — цена — длительность):");
@@ -374,11 +418,12 @@ function renderSummary(shop) {
   lines.push(`<b>${esc(shop.name || "Точка без названия")}</b>${shop.demo ? " <i>(демо-данные)</i>" : ""}`);
   if (shop.city || shop.address) lines.push(`📍 ${esc([shop.city, shop.address].filter(Boolean).join(", "))}`);
   if (shop.phone) lines.push(`📞 ${esc(shop.phone)}`);
-  lines.push(`🕐 ${esc(hoursLines(shop).join("; "))}`);
-  lines.push(`✂️ Услуг: ${shop.services.length} · слот ${shop.slotMinutes} мин`);
+  if (shop.yclients) lines.push(`🔗 YCLIENTS: компания ${esc(shop.yclients.companyId)} — расписание и записи там`);
+  if (!shop.yclients || Object.values(shop.hours).some(Boolean)) lines.push(`🕐 ${esc(hoursLines(shop).join("; "))}`);
+  lines.push(`✂️ Услуг: ${shop.services.length}${shop.yclients ? "" : ` · слот ${shop.slotMinutes} мин`}`);
   lines.push(`👤 Мастера: ${esc(shop.staff.map((s) => s.name).join(", "))}`);
   lines.push(`📚 Заметок-знаний: ${shop.knowledge.length}`);
-  lines.push(`🎲 Демо-занятость в расписании: ${shop.demoBusy ? "вкл" : "выкл"}`);
+  if (!shop.yclients) lines.push(`🎲 Демо-занятость в расписании: ${shop.demoBusy ? "вкл" : "выкл"}`);
   return lines.join("\n");
 }
 
@@ -421,6 +466,7 @@ module.exports = {
   renderFull,
   hoursLines,
   serviceLine,
+  serviceMinutes,
   findService,
   findStaff,
 };
