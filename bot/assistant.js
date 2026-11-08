@@ -3,13 +3,8 @@
 const { textOf, parseJson, LlmError } = require("./llm");
 const { renderForPrompt } = require("./shop");
 const { nowParts, addDays, fmtDate, fmtTime, WEEKDAY_LONG } = require("./time");
-const {
-  findFreeSlots,
-  createBooking,
-  cancelBooking,
-  upcomingBookings,
-  bookingForTool,
-} = require("./schedule");
+const { upcomingBookings, bookingForTool } = require("./schedule");
+const { localBackend } = require("./booking");
 
 const REPLY_SCHEMA = {
   type: "object",
@@ -99,7 +94,11 @@ function stablePrompt(shop) {
 - Свободное время узнавай только через get_free_slots и никогда не придумывай его. Если клиент назвал день — смотри с этого дня; если нет — предложи 2–4 ближайших варианта.
 - Услуга занимает несколько слотов подряд (обычно от 1 до 4), инструменты это учитывают сами — просто передавай id услуги.
 - Если непонятно, какая услуга нужна, уточни одним вопросом.
-- Для записи нужны услуга, дата и время из свободных и имя. Телефон попроси, но если клиент не хочет — записывай без него.
+- Для записи нужны услуга, дата и время из свободных и имя. ${
+    shop.yclients
+      ? "Телефон обязателен: запись уходит в журнал салона (YCLIENTS) и без номера не пройдёт. Если клиент не хочет давать номер — объясни это и предложи позвать мастера."
+      : "Телефон попроси, но если клиент не хочет — записывай без него."
+  }
 - Когда всё известно и клиент согласился на конкретное время — вызывай create_booking. Потом подтверди одной фразой: услуга, день и время, мастер, адрес.
 - Перенос: cancel_booking старой записи и create_booking новой. Отмена — cancel_booking.
 
@@ -161,11 +160,13 @@ function buildMessages(conv, limit = 30) {
   return out;
 }
 
-function runTool(name, input, ctx) {
+// backend — где живёт расписание: в боте или в YCLIENTS (см. booking.js)
+async function runTool(name, input, ctx) {
   const { state, shop, conv, now } = ctx;
+  const backend = ctx.backend || localBackend(state, shop);
   switch (name) {
     case "get_free_slots": {
-      const r = findFreeSlots(state, shop, {
+      const r = await backend.freeSlots({
         serviceId: input.service_id,
         dateFrom: input.date_from,
         days: input.days,
@@ -175,7 +176,7 @@ function runTool(name, input, ctx) {
       return { content: JSON.stringify(r), isError: Boolean(r.error) };
     }
     case "create_booking": {
-      const r = createBooking(state, shop, {
+      const r = await backend.book({
         serviceId: input.service_id,
         date: input.date,
         time: input.time,
@@ -203,7 +204,7 @@ function runTool(name, input, ctx) {
       return { content: JSON.stringify({ bookings: list }) };
     }
     case "cancel_booking": {
-      const r = cancelBooking(state, input.booking_id, { clientKey: conv.id, by: "client", now });
+      const r = await backend.cancel(input.booking_id, { clientKey: conv.id, by: "client", now });
       if (!r.ok) return { content: JSON.stringify({ error: r.error }), isError: true };
       return {
         content: JSON.stringify({ ok: true, cancelled: bookingForTool(r.booking, shop, now) }),
@@ -216,7 +217,7 @@ function runTool(name, input, ctx) {
 }
 
 // Один ход ассистента. Никогда не бросает: возвращает reply / handoff / error.
-async function generateReply({ llm, cfg, state, shop, conv, now = Date.now(), log = console }) {
+async function generateReply({ llm, cfg, state, shop, conv, backend, now = Date.now(), log = console }) {
   const effects = [];
   const deadline = Date.now() + cfg.llmTimeoutMs;
   const messages = buildMessages(conv);
@@ -254,17 +255,19 @@ async function generateReply({ llm, cfg, state, shop, conv, now = Date.now(), lo
       if (toolUses.length) {
         // Блоки ответа (включая thinking) возвращаем как есть
         messages.push({ role: "assistant", content: resp.content });
-        const results = toolUses.map((tu) => {
+        // По очереди: запись и отмена меняют расписание
+        const results = [];
+        for (const tu of toolUses) {
           let r;
           try {
-            r = runTool(tu.name, tu.input || {}, { state, shop, conv, now });
+            r = await runTool(tu.name, tu.input || {}, { state, shop, conv, now, backend });
           } catch (e) {
             log.error("Инструмент", tu.name, e);
             r = { content: JSON.stringify({ error: "внутренняя ошибка инструмента" }), isError: true };
           }
           if (r.effect) effects.push(r.effect);
-          return { type: "tool_result", tool_use_id: tu.id, content: r.content, ...(r.isError ? { is_error: true } : {}) };
-        });
+          results.push({ type: "tool_result", tool_use_id: tu.id, content: r.content, ...(r.isError ? { is_error: true } : {}) });
+        }
         messages.push({ role: "user", content: results });
         continue;
       }

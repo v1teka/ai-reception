@@ -1,6 +1,8 @@
 // Ядро бота: маршрутизация апдейтов, разговоры с клиентами, ответы ИИ,
 // передача мастеру, Telegram Business, напоминания. Панель мастера — в console.js.
 const { generateReply } = require("./assistant");
+const { bookingBackend } = require("./booking");
+const { YclientsApi } = require("./yclients");
 const { typingDuration, splitReply } = require("./typing");
 const { upcomingBookings, bookingLabel, minutesUntilStart } = require("./schedule");
 const { nowParts } = require("./time");
@@ -9,7 +11,7 @@ const { esc, truncate, sleep: realSleep, randomCode, userName } = require("./uti
 const HOUR = 3600000;
 
 class App {
-  constructor({ cfg, store, api, consoleApi, llm, log = console, now = () => Date.now(), sleep = realSleep, fetchImpl }) {
+  constructor({ cfg, store, api, consoleApi, llm, log = console, now = () => Date.now(), sleep = realSleep, fetchImpl, yclients }) {
     this.cfg = cfg;
     this.store = store;
     this.api = api; // бот для клиентов
@@ -20,6 +22,11 @@ class App {
     this.now = now;
     this.sleep = sleep;
     this.fetchImpl = fetchImpl;
+    this.yclients =
+      yclients ||
+      (cfg.yclientsPartnerToken
+        ? new YclientsApi({ partnerToken: cfg.yclientsPartnerToken, base: cfg.yclientsApiBase, timeoutMs: cfg.yclientsTimeoutMs, log })
+        : null);
     this.timers = new Map(); // id разговора -> таймер «дождаться, пока клиент допишет»
     this.busy = new Set(); // разговоры, по которым сейчас думает ИИ
     this.setupBuffers = new Map(); // id мастера -> накопленный ввод для настройки
@@ -36,6 +43,10 @@ class App {
   }
   save() {
     this.store.save();
+  }
+  // Расписание: своё или YCLIENTS — в зависимости от настроек точки
+  backend() {
+    return bookingBackend({ state: this.state, shop: this.shop, yclients: this.yclients, log: this.log });
   }
 
   // ---------- запуск ----------
@@ -334,7 +345,16 @@ class App {
         conv.llmCalls.push(this.now());
 
         const seen = conv.msgCount;
-        const result = await generateReply({ llm: this.llm, cfg: this.cfg, state: this.state, shop: this.shop, conv, now: this.now(), log: this.log });
+        const result = await generateReply({
+          llm: this.llm,
+          cfg: this.cfg,
+          state: this.state,
+          shop: this.shop,
+          conv,
+          backend: this.backend(),
+          now: this.now(),
+          log: this.log,
+        });
         for (const ef of result.effects) await this.onEffect(conv, ef);
         this.save();
         if (conv.status !== "bot") return; // мастер перехватил, пока ИИ думал
@@ -460,7 +480,7 @@ class App {
           b.staffName
         )}\n👤 ${esc(b.client.name || conv.client.name)}${b.client.phone ? ` · ${esc(b.client.phone)}` : ""}${
           b.client.username ? ` · @${esc(b.client.username)}` : ""
-        }${b.comment ? `\n💬 ${esc(b.comment)}` : ""}`,
+        }${b.comment ? `\n💬 ${esc(b.comment)}` : ""}${b.yc ? `\n🔗 В журнале YCLIENTS: запись №${esc(b.yc.recordId)}` : ""}`,
         [
           [
             { text: "💬 Переписка", callback_data: `c:open:${conv.id}` },
@@ -625,6 +645,13 @@ class App {
       const left = minutesUntilStart(b, shop, this.now());
       if (left > this.cfg.reminderMinutes || left <= 0) continue;
       b.remindedAt = this.now();
+      // Запись могли отменить прямо в YCLIENTS — тогда не напоминаем
+      if (b.yc && !(await this.backend().stillActive(b))) {
+        b.status = "cancelled";
+        b.cancelledAt = this.now();
+        b.cancelledBy = "yclients";
+        continue;
+      }
       // Не напоминаем о записи, сделанной перед самым визитом
       if (minutesUntilStart(b, shop, b.createdAt) < this.cfg.reminderMinutes + 30) continue;
       const conv = this.conv(b.client?.key);

@@ -26,6 +26,11 @@ function loadConfig(env = process.env) {
     fallbacks: !off(env.ANTHROPIC_FALLBACKS),
     yandexWebFetch: !off(env.YANDEX_WEB_FETCH),
 
+    // YCLIENTS: ключ партнёра из кабинета разработчика (маркетплейс YCLIENTS → «Настройки аккаунта»)
+    yclientsPartnerToken: env.YCLIENTS_PARTNER_TOKEN || "",
+    yclientsApiBase: env.YCLIENTS_API_BASE || "https://api.yclients.com/api/v1",
+    yclientsTimeoutMs: num(env.YCLIENTS_TIMEOUT_MS, 10000),
+
     llmTimeoutMs: num(env.LLM_TIMEOUT_MS, 30000),
     setupTimeoutMs: num(env.SETUP_TIMEOUT_MS, 120000),
     maxSteps: num(env.LLM_MAX_STEPS, 6),
