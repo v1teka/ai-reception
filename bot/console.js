@@ -303,6 +303,16 @@ const methods = {
     ]);
   },
 
+  // Подробности сбоя импорта (HTML) — для владельца бота
+  importFailureDetails(r) {
+    const lines = [`<b>Причина:</b> ${esc(r.reason || "неизвестна")}`];
+    if (r.details?.length) {
+      lines.push("<b>Что было:</b>");
+      for (const d of r.details.slice(0, 10)) lines.push(`• ${esc(truncate(d, 500))}`);
+    }
+    return lines.join("\n");
+  },
+
   setMode(a, mode, extra = {}) {
     a.mode = mode;
     Object.assign(a, extra);
@@ -361,9 +371,26 @@ const methods = {
       const r = await importFromYandex({ llm: this.llm, cfg: this.cfg, url, prevShop: this.shop, fetchImpl: this.fetchImpl, log: this.log });
       if (!r.ok) {
         this.setMode(a, "await_edit", { freshBase: true, pending: null });
-        return say(
-          `😕 Не получилось прочитать карточку: ${esc(r.reason)}.\n\nПришлите скриншоты карточки и прайса из Яндекс.Карт (можно несколько) или просто перечислите текстом: название, адрес, график и услуги с ценами и длительностью. Разберу сам.`,
+        // Техническая причина — только владельцу бота. Мастер видит просьбу прислать данные иначе.
+        const isOwner = this.role(adminId) === "owner";
+        await say(
+          `😕 Не получилось прочитать карточку с Яндекс.Карт.\n\nПришлите скриншоты карточки и прайса из Яндекс.Карт (можно несколько) или просто перечислите текстом: название, адрес, график и услуги с ценами и длительностью. Разберу сам.${
+            isOwner ? `\n\n<i>Подробности видны только владельцу бота.</i>\n${this.importFailureDetails(r)}` : ""
+          }`,
           [[btn("❌ Отменить", "s:cancel")]]
+        );
+        const who = `${esc(a.name || "Мастер")}${a.username ? ` @${esc(a.username)}` : ""} (id ${a.id})`;
+        return this.notifyOwners(
+          [
+            "⚠️ <b>Не получилось загрузить точку с Яндекс.Карт</b>",
+            `👤 ${who}`,
+            `🗺 ${esc(url)}`,
+            "",
+            this.importFailureDetails(r),
+            "",
+            "<i>Мастеру предложено прислать скриншоты или текст. Причину он не видит.</i>",
+          ].join("\n"),
+          { except: adminId }
         );
       }
       this.setMode(a, "review", { pending: r.shop, freshBase: false });

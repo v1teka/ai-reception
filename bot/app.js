@@ -677,6 +677,15 @@ class App {
     this.save();
   }
 
+  // Технические сообщения (сбои импорта и т. п.) — только владельцам бота, не мастерам точки.
+  // Переключатель «Уведомления» здесь не действует: он про переписки с клиентами.
+  async notifyOwners(text, { except } = {}) {
+    for (const a of Object.values(this.state.admins)) {
+      if (this.role(a.id) !== "owner" || Number(a.id) === Number(except)) continue;
+      await this.notifyAdmin(a.id, text);
+    }
+  }
+
   clientLine(conv) {
     const c = conv.client || {};
     const via = conv.kind === "business" ? "пишет вам в Telegram" : "пишет боту";

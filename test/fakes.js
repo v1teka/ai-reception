@@ -156,4 +156,4 @@ function tmpFile() {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "barber-bot-")), "state.json");
 }
 
-module.exports = { FakeTelegram, FakeAnthropic, final, toolUse, tmpFile };
+module.exports = { FakeTelegram, FakeAnthropic, final, toolUse, message, tmpFile };

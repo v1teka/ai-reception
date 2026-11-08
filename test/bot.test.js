@@ -2,7 +2,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { FakeTelegram, FakeAnthropic, final, toolUse, tmpFile } = require("./fakes");
+const { FakeTelegram, FakeAnthropic, final, toolUse, message, tmpFile } = require("./fakes");
 const { loadConfig } = require("../bot/config");
 const { Store } = require("../bot/store");
 const { TelegramApi, Poller } = require("../bot/telegram");
@@ -66,6 +66,14 @@ async function adminSays(app, text, source = "main", extra = {}) {
     { update_id: upd++, message: { message_id: upd, chat: { id: OWNER, type: "private" }, from: user(OWNER, "Мастер", "boss"), date: 0, text, ...extra } },
     source
   );
+}
+
+// Сообщение от другого мастера (не владельца)
+async function masterSays(app, id, text) {
+  await app.handleUpdate({
+    update_id: upd++,
+    message: { message_id: upd, chat: { id, type: "private" }, from: user(id, "Руслан", "ruslan"), date: 0, text },
+  });
 }
 
 async function press(app, data, source = "main", from = OWNER) {
@@ -474,6 +482,59 @@ test("настройка: если Яндекс показал капчу — п
   assert.match(tg.sentTo(OWNER).at(-1).params.text, /капчу/);
   assert.equal(app.state.admins[OWNER].mode, "await_edit");
   assert.equal(an.requests.length, 0);
+});
+
+test("настройка: причину сбоя видит владелец бота, а мастер — только просьбу прислать данные иначе", async () => {
+  const MASTER = 300;
+  const app = await makeApp({ env: { YANDEX_WEB_FETCH: "off", ADMIN_IDS: String(MASTER) } });
+  app.fetchImpl = async () => ({ status: 200, url: "https://yandex.ru/showcaptcha?cc=1", text: async () => "SmartCaptcha" });
+  await press(app, "s:yandex", "main", MASTER);
+  await masterSays(app, MASTER, "https://maps.yandex.ru/org/x/123456789/");
+  await app.idle();
+
+  const toMaster = tg.sentTo(MASTER).at(-1).params.text;
+  assert.match(toMaster, /Не получилось прочитать карточку/);
+  assert.match(toMaster, /Пришлите скриншоты/);
+  assert.doesNotMatch(toMaster, /капч|HTTP|Причина/i);
+  assert.equal(app.state.admins[MASTER].mode, "await_edit");
+
+  const toOwner = tg.sentTo(OWNER).at(-1).params.text;
+  assert.match(toOwner, /Не получилось загрузить точку с Яндекс\.Карт/);
+  assert.match(toOwner, /Руслан @ruslan \(id 300\)/);
+  assert.match(toOwner, /maps\.yandex\.ru\/org\/x\/123456789/);
+  assert.match(toOwner, /Причина:<\/b> Яндекс показал капчу/);
+  assert.match(toOwner, /Карточка: HTTP 200, 12 Б, итоговый адрес https:\/\/yandex\.ru\/showcaptcha\?cc=1, капча/);
+  assert.match(toOwner, /выключен \(YANDEX_WEB_FETCH=off\)/);
+  assert.equal(an.requests.length, 0);
+});
+
+test("настройка: владелец видит ошибку ИИ и ответ web_fetch, а не «не получилось разобрать»", async () => {
+  const app = await makeApp();
+  an.respond = (body) => {
+    if (!body.tools) return { status: 400, error: "bad request" }; // разбор страницы
+    return message(
+      [
+        { type: "server_tool_use", id: "srvtoolu_1", name: "web_fetch", input: { url: "https://yandex.ru/maps/org/x/123456789/" } },
+        { type: "web_fetch_tool_result", tool_use_id: "srvtoolu_1", content: { type: "web_fetch_tool_result_error", error_code: "url_not_accessible" } },
+        { type: "text", text: JSON.stringify({ ...importedShop, name: "", services: [], changes: [] }) },
+      ],
+      "end_turn"
+    );
+  };
+  await press(app, "s:yandex");
+  await adminSays(app, "https://yandex.ru/maps/org/x/123456789/");
+  await app.idle();
+  assert.equal(an.requests.length, 2);
+  const text = tg.sentTo(OWNER).at(-1).params.text;
+  assert.match(text, /Пришлите скриншоты/);
+  assert.match(text, /видны только владельцу/);
+  assert.match(text, /Причина:<\/b> не получилось разобрать карточку \(ошибка запроса к ИИ\)/);
+  assert.match(text, /Карточка: HTTP 200/);
+  assert.match(text, /Вкладка «Цены»: HTTP 200/);
+  assert.match(text, /Разбор страницы ИИ: ошибка запроса к ИИ \(400 .*bad request/);
+  assert.match(text, /Запасной путь \(ИИ сам открывает ссылку\): ИИ не получил данных со страницы; https:\/\/yandex\.ru\/maps\/org\/x\/123456789\/ → ошибка url_not_accessible/);
+  // Владелец сам загружал — отдельного уведомления ему нет
+  assert.equal(tg.sentTo(OWNER).filter((m) => /Не получилось загрузить точку/.test(m.params.text)).length, 0);
 });
 
 test("знания: заметка сохраняется как есть и попадает в промпт", async () => {

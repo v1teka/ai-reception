@@ -2,8 +2,9 @@
 // превращаем в текст и отдаём ИИ на разбор (см. setup.js).
 // Яндекс иногда показывает капчу серверам — тогда мастер присылает скриншоты или текст.
 
+// yandex.ru/maps/…, yandex.ru/profile/…, ya.ru/maps/… и старый домен maps.yandex.ru/…
 const YANDEX_URL_RE =
-  /https?:\/\/(?:www\.)?(?:yandex\.(?:ru|com|by|kz|uz|com\.tr|ua)|ya\.ru)\/(?:maps|profile|web-maps)[^\s<>"']*/i;
+  /https?:\/\/(?:(?:www\.)?(?:yandex\.(?:ru|com|by|kz|uz|com\.tr|ua)|ya\.ru)\/(?:maps|profile|web-maps)|maps\.yandex\.(?:ru|com|by|kz|uz|com\.tr|ua)(?![\w.-]))[^\s<>"']*/i;
 
 function extractYandexUrl(text) {
   const m = String(text || "").match(YANDEX_URL_RE);
@@ -86,32 +87,64 @@ async function fetchPage(url, fetchImpl, timeoutMs) {
   }
 }
 
-// → { ok: true, text, url, orgId } | { ok: false, reason }
-async function fetchOrgText(url, { fetchImpl = fetch, timeoutMs = 15000, maxChars = 60000 } = {}) {
-  let main;
-  try {
-    main = await fetchPage(url, fetchImpl, timeoutMs);
-  } catch (e) {
-    return { ok: false, reason: `не удалось открыть страницу (${e.name === "AbortError" ? "таймаут" : e.message})` };
-  }
-  if (looksLikeCaptcha(main.url, main.html)) return { ok: false, reason: "Яндекс показал капчу вместо страницы" };
-  if (main.status >= 400) return { ok: false, reason: `Яндекс ответил ошибкой ${main.status}` };
-
-  const orgId = parseOrgId(main.url) || parseOrgId(url) || parseOrgId(main.html);
-  let text = htmlToText(main.html);
-
-  // Прайс обычно на отдельной вкладке /prices/
-  const base = (main.url.match(/^(https?:\/\/[^?#]*\/org\/[^?#]*?\d{5,})/) || [])[1];
-  if (base) {
-    try {
-      const prices = await fetchPage(base.replace(/\/$/, "") + "/prices/", fetchImpl, timeoutMs);
-      if (prices.status < 400 && !looksLikeCaptcha(prices.url, prices.html)) {
-        text += "\n\n=== Вкладка «Цены» ===\n" + htmlToText(prices.html);
-      }
-    } catch {}
-  }
-  if (text.replace(/\s/g, "").length < 100) return { ok: false, reason: "на странице почти нет текста" };
-  return { ok: true, text: text.slice(0, maxChars), url: main.url, orgId };
+// «fetch failed» сам по себе ничего не говорит: настоящая причина (DNS, отказ в соединении,
+// сертификат) лежит в e.cause
+function fetchError(e) {
+  if (e?.name === "AbortError") return "таймаут";
+  const cause = e?.cause?.code || e?.cause?.message;
+  return cause && cause !== e.message ? `${e.message}: ${cause}` : String(e?.message || e);
 }
 
-module.exports = { extractYandexUrl, parseOrgId, htmlToText, fetchOrgText, looksLikeCaptcha };
+const shortUrl = (u, max = 200) => (u.length > max ? u.slice(0, max) + "…" : u);
+
+// Одна строка о запросе к Яндексу: для логов и для владельца бота
+function describeFetch(p) {
+  if (p.error) return `${p.what}: ${p.error}`;
+  const parts = [`HTTP ${p.status}`, p.bytes < 1024 ? `${p.bytes} Б` : `${Math.round(p.bytes / 1024)} КБ`];
+  if (p.finalUrl && p.finalUrl !== p.url) parts.push(`итоговый адрес ${shortUrl(p.finalUrl)}`);
+  if (p.captcha) parts.push("капча");
+  return `${p.what}: ${parts.join(", ")}`;
+}
+
+// → { ok: true, text, url, orgId, pages } | { ok: false, reason, pages }
+// pages — что Яндекс ответил на каждый запрос (статус, итоговый адрес после редиректов, капча)
+async function fetchOrgText(url, { fetchImpl = fetch, timeoutMs = 15000, maxChars = 60000, log } = {}) {
+  const pages = [];
+  const get = async (what, pageUrl) => {
+    const p = { what, url: pageUrl };
+    let html = "";
+    try {
+      const r = await fetchPage(pageUrl, fetchImpl, timeoutMs);
+      html = r.html;
+      Object.assign(p, { status: r.status, finalUrl: r.url, bytes: Buffer.byteLength(html), captcha: looksLikeCaptcha(r.url, html) });
+    } catch (e) {
+      p.error = fetchError(e);
+    }
+    pages.push(p);
+    const bad = p.error || p.captcha || p.status >= 400;
+    log?.[bad ? "warn" : "info"]?.(`Яндекс.Карты: ${shortUrl(pageUrl)} → ${describeFetch(p)}`);
+    return { p, html };
+  };
+  const fail = (reason) => ({ ok: false, reason, pages });
+
+  const { p: main, html } = await get("Карточка", url);
+  if (main.error) return fail(`не удалось открыть страницу (${main.error})`);
+  if (main.captcha) return fail("Яндекс показал капчу вместо страницы");
+  if (main.status >= 400) return fail(`Яндекс ответил ошибкой ${main.status}`);
+
+  const orgId = parseOrgId(main.finalUrl) || parseOrgId(url) || parseOrgId(html);
+  let text = htmlToText(html);
+
+  // Прайс обычно на отдельной вкладке /prices/
+  const base = (main.finalUrl.match(/^(https?:\/\/[^?#]*\/org\/[^?#]*?\d{5,})/) || [])[1];
+  if (base) {
+    const { p: prices, html: pricesHtml } = await get("Вкладка «Цены»", base.replace(/\/$/, "") + "/prices/");
+    if (!prices.error && prices.status < 400 && !prices.captcha) {
+      text += "\n\n=== Вкладка «Цены» ===\n" + htmlToText(pricesHtml);
+    }
+  }
+  if (text.replace(/\s/g, "").length < 100) return fail("на странице почти нет текста");
+  return { ok: true, text: text.slice(0, maxChars), url: main.finalUrl, orgId, pages };
+}
+
+module.exports = { extractYandexUrl, parseOrgId, htmlToText, fetchOrgText, looksLikeCaptcha, describeFetch };
