@@ -246,14 +246,16 @@ const methods = {
     const today = nowParts(this.shop.timezone, this.now()).date;
     this.save();
     const conv = this.conv(b.client?.key);
-    if (conv) {
+    if (!conv) return this.consoleApi.sendMessage(adminId, `Запись ${b.id} отменена.`);
+    // Сообщение клиенту «печатается» несколько секунд — отправляем в фоне, чтобы не задерживать другие апдейты
+    this.run(async () => {
       await this.deliver(
         conv,
         `К сожалению, мастеру пришлось отменить вашу запись: ${b.serviceName}, ${bookingLabel(b, today)}. Подобрать другое время?`,
         "admin"
       );
-    }
-    return this.consoleApi.sendMessage(adminId, `Запись ${b.id} отменена${conv ? ", клиенту отправлено сообщение" : ""}.`);
+      await this.consoleApi.sendMessage(adminId, `Запись ${b.id} отменена, клиенту отправлено сообщение.`);
+    });
   },
 
   // ---------- настройки точки ----------
@@ -703,14 +705,26 @@ const methods = {
           conv.handoff = null;
           this.save();
           await answer("Отправляю");
-          await this.deliver(conv, draft, "bot");
-          return this.notifyAdmin(uid, `✅ Черновик отправлен <b>${esc(conv.client.name)}</b>.`, null, conv.id);
+          // «Печатает…» идёт в фоне, чтобы не задерживать остальные апдейты. Пока черновик уходит,
+          // ИИ в этом чате не отвечает, а потом отвечает на то, что клиент успел дописать.
+          this.run(async () => {
+            this.busy.add(conv.id);
+            try {
+              await this.deliver(conv, draft, "bot");
+            } finally {
+              this.busy.delete(conv.id);
+            }
+            if (!this.timers.has(conv.id)) this.schedule(conv.id, 0);
+            await this.notifyAdmin(uid, `✅ Черновик отправлен <b>${esc(conv.client.name)}</b>.`, null, conv.id);
+          });
+          return;
         }
         case "retry":
           if (conv.status === "admin" && conv.handledBy !== uid) return answer("Этот диалог ведёт другой мастер", true);
           await answer("Бот пробует ещё раз");
           await this.returnToBot(conv, { answerPending: false });
-          return this.run(() => this.processConv(conv.id));
+          this.run(() => this.processConv(conv.id));
+          return;
         case "close":
           conv.session = { ...(conv.session || {}), closed: true };
           if (conv.status !== "bot") await this.returnToBot(conv, { answerPending: false });

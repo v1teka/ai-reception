@@ -30,18 +30,30 @@ const MONTHS_GEN = [
 
 const pad = (n) => String(n).padStart(2, "0");
 
+// Создавать Intl.DateTimeFormat дорого (~60 мкс), а nowParts вызывается на каждую запись
+// при подборе слотов и напоминаниях — держим по одному форматтеру на часовой пояс.
+const formatters = new Map();
+function formatter(timeZone) {
+  let f = formatters.get(timeZone);
+  if (!f) {
+    f = new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    });
+    formatters.set(timeZone, f);
+  }
+  return f;
+}
+
 // Текущие дата и время в нужном часовом поясе.
 function nowParts(timeZone, now = Date.now()) {
   const parts = {};
-  for (const p of new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  }).formatToParts(new Date(now))) {
+  for (const p of formatter(timeZone).formatToParts(new Date(now))) {
     parts[p.type] = p.value;
   }
   const date = `${parts.year}-${parts.month}-${parts.day}`;
