@@ -7,6 +7,10 @@ const { freeStarts, findFreeSlots, createBooking, cancelBooking, demoBusy } = re
 const { typingDuration, splitReply } = require("../bot/typing");
 const { extractYandexUrl, parseOrgId, htmlToText, looksLikeCaptcha } = require("../bot/yandex");
 const { buildMessages } = require("../bot/assistant");
+const { Store } = require("../bot/store");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
 // Четверг, 5 ноября 2026, 13:00 по Москве
 const NOW = Date.parse("2026-11-05T10:00:00Z");
@@ -33,6 +37,22 @@ test("время в поясе точки", () => {
   assert.equal(parseTime("9:30"), 570);
   assert.equal(parseTime("25:00"), null);
   assert.equal(minutesUntil("2026-11-06", 600, "Europe/Moscow", NOW), 21 * 60);
+  // Форматтеры кэшируются по поясу — пояса не путаются
+  assert.equal(fmtTime(nowParts("Asia/Yekaterinburg", NOW).minutes), "15:00");
+  assert.equal(fmtTime(nowParts("Europe/Moscow", NOW).minutes), "13:00");
+});
+
+test("битый файл состояния не затирается: копия остаётся рядом", () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "barber-store-")), "state.json");
+  fs.writeFileSync(file, '{"shop": {"name": "Моя точка",}}'); // лишняя запятая после ручной правки
+  const store = new Store(file, { log: { error() {} } });
+  store.load();
+  assert.equal(store.state.shop.demo, true, "начинаем с демо-данных");
+  const backups = fs.readdirSync(path.dirname(file)).filter((f) => f.startsWith("state.json.broken-"));
+  assert.equal(backups.length, 1);
+  assert.equal(fs.readFileSync(path.join(path.dirname(file), backups[0]), "utf8"), '{"shop": {"name": "Моя точка",}}');
+  store.flush();
+  assert.equal(new Store(file).load().shop.demo, true);
 });
 
 test("услуга на 3 слота не наезжает на занятое время", () => {

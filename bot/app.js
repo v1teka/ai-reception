@@ -54,6 +54,21 @@ class App {
     }
     this.save();
     await this.setCommands().catch((e) => this.log.warn("setMyCommands:", e.message));
+    this.resumePending();
+  }
+
+  // Перезапуск (например, автодеплой) обрывает ответы «на лету»: сообщение клиента уже сохранено,
+  // а ответа нет и никто его не запланирует. Подхватываем такие переписки за последний час.
+  resumePending(maxAgeMs = HOUR) {
+    const now = this.now();
+    let n = 0;
+    for (const c of Object.values(this.state.conversations)) {
+      if (c.status !== "bot" || now - (c.lastClientAt || 0) > maxAgeMs) continue;
+      if (!this.pendingClientMessages(c).some((m) => !m.service)) continue;
+      this.schedule(c.id);
+      n++;
+    }
+    if (n) this.log.info(`Переписок без ответа после перезапуска: ${n}, отвечаю.`);
   }
 
   async setCommands() {
@@ -213,10 +228,16 @@ class App {
     return c;
   }
 
-  pushMessage(conv, m) {
+  // after — номер последнего сообщения, которое видел ИИ (или бот, начиная отправку).
+  // Ответ встаёт сразу за ним, а то, что клиент дописал, пока бот думал или «печатал»,
+  // остаётся в конце и считается неотвеченным — иначе такие сообщения терялись.
+  pushMessage(conv, m, { after } = {}) {
     conv.msgCount = (conv.msgCount || conv.messages.length) + 1;
-    conv.messages.push({ at: this.now(), ...m });
-    if (conv.messages.length > 100) conv.messages.splice(0, conv.messages.length - 100);
+    const msgs = conv.messages;
+    let i = msgs.length;
+    if (after != null) while (i > 0 && msgs[i - 1].role === "client" && msgs[i - 1].seq > after) i--;
+    msgs.splice(i, 0, { at: this.now(), seq: conv.msgCount, ...m });
+    if (msgs.length > 100) msgs.splice(0, msgs.length - 100);
     conv.updatedAt = this.now();
   }
 
@@ -351,8 +372,8 @@ class App {
           });
           return;
         }
-        await this.deliver(conv, result.text, "bot");
-        // следующий круг подхватит то, что клиент написал, пока бот «печатал»
+        await this.deliver(conv, result.text, "bot", { after: seen });
+        // следующий круг подхватит то, что клиент написал, пока бот думал или «печатал»
       }
       again = true;
     } finally {
@@ -406,7 +427,8 @@ class App {
   }
 
   // Ответ бота: прочитать → «печатает» пропорционально длине → отправить. Длинный ответ — частями.
-  async deliver(conv, text, role = "bot") {
+  // after — см. pushMessage; по умолчанию ответ относится ко всему, что было до начала отправки.
+  async deliver(conv, text, role = "bot", { after = conv.msgCount } = {}) {
     const parts = splitReply(text);
     if (!parts.length) return;
     await this.markRead(conv);
@@ -416,7 +438,7 @@ class App {
       if (role === "bot" && conv.status !== "bot") return; // мастер перехватил на полуслове
       try {
         const sent = await this.sendToClient(conv, parts[i]);
-        this.pushMessage(conv, { role, text: parts[i], mid: sent?.message_id });
+        this.pushMessage(conv, { role, text: parts[i], mid: sent?.message_id }, { after });
         conv.lastReplyAt = this.now();
       } catch (e) {
         this.log.error("Не удалось отправить клиенту:", e.message);
@@ -620,11 +642,13 @@ class App {
 
   async checkReminders() {
     const shop = this.shop;
+    let changed = false;
     for (const b of upcomingBookings(this.state, shop, { now: this.now() })) {
       if (b.remindedAt) continue;
       const left = minutesUntilStart(b, shop, this.now());
       if (left > this.cfg.reminderMinutes || left <= 0) continue;
       b.remindedAt = this.now();
+      changed = true;
       // Не напоминаем о записи, сделанной перед самым визитом
       if (minutesUntilStart(b, shop, b.createdAt) < this.cfg.reminderMinutes + 30) continue;
       const conv = this.conv(b.client?.key);
@@ -635,7 +659,8 @@ class App {
       } 💈`;
       await this.deliver(conv, text, "bot").catch((e) => this.log.warn("Напоминание:", e.message));
     }
-    this.save();
+    // Проверка идёт раз в минуту — без изменений не переписываем файл состояния
+    if (changed) this.save();
   }
 
   // ---------- уведомления мастерам ----------

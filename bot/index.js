@@ -64,10 +64,20 @@ async function main() {
     `Бот @${app.me.username} запущен${consoleApi ? `, панель мастера — @${app.consoleMe.username}` : ""}. Модель: ${cfg.model}.`
   );
 
-  const stop = () => {
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) {
+      // Повторный Ctrl+C — выходим сразу
+      store.flush();
+      process.exit(0);
+    }
+    stopping = true;
     log.info("Останавливаюсь…");
     clearInterval(reminders);
     for (const p of pollers) p.stop();
+    // Даём дописать начатые ответы: docker stop ждёт 10 с, потом убивает процесс.
+    // Что не успело уйти, бот подхватит после запуска (App.resumePending).
+    await app.idle(7000).catch(() => log.warn("Не все ответы успели уйти — отвечу после перезапуска."));
     store.flush();
     process.exit(0);
   };

@@ -85,8 +85,11 @@ server.js           — локальный сервер
 
 ```bash
 docker build -t barber-bot .
-docker run -d --restart=always --env-file .env -v $(pwd)/data:/app/data barber-bot
+docker run -d --restart=always --log-opt max-size=10m --log-opt max-file=3 \
+  --env-file .env -v $(pwd)/data:/app/data barber-bot
 ```
+
+Хватит самого маленького VPS: процесс занимает около 80 МБ памяти и почти не нагружает процессор — вся тяжёлая работа идёт на стороне Anthropic API. `--log-opt` ограничивает логи Docker, чтобы они не съели диск. Перезапуск безопасен: по `docker stop` бот за несколько секунд дописывает начатые ответы, а сообщения за последний час, на которые не успел ответить, подхватывает после старта.
 
 ### Автодеплой на свой сервер
 

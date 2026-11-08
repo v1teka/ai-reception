@@ -26,7 +26,7 @@ test.after(() => {
   an.close();
 });
 
-async function makeApp({ adminBot = false, env = {} } = {}) {
+async function makeApp({ adminBot = false, env = {}, dataFile = tmpFile() } = {}) {
   tg.reset();
   an.reset();
   clock = Date.parse("2026-11-05T10:00:00Z"); // чт 13:00 МСК
@@ -39,7 +39,7 @@ async function makeApp({ adminBot = false, env = {} } = {}) {
     llmTimeoutMs: 1500,
     setupTimeoutMs: 3000,
     typing: { baseMs: 0, perCharMs: 3, minMs: 60, maxMs: 600, pauseMs: 10 },
-    dataFile: tmpFile(),
+    dataFile,
   };
   const store = new Store(cfg.dataFile, { log: quiet });
   store.load();
@@ -129,6 +129,47 @@ test("несколько сообщений подряд — один ответ
   assert.equal(an.requests.length, 1);
   assert.equal(an.requests[0].body.messages.at(-1).content, "Здравствуйте\nхочу на стрижку");
   assert.equal(tg.sentTo(502).length, 1);
+});
+
+test("клиент дописал, пока бот «печатал», — бот отвечает и на это", async () => {
+  const app = await makeApp();
+  app.cfg.typing = { ...app.cfg.typing, minMs: 300, maxMs: 300 };
+  let n = 0;
+  an.respond = () => confident(`Ответ ${++n}`);
+  await clientSays(app, 509, "Сколько стоит стрижка?");
+  while (!tg.of("sendChatAction", (p) => p.chat_id === 509).length) await new Promise((r) => setTimeout(r, 5));
+  await clientSays(app, 509, "И борода тоже");
+  await app.idle();
+
+  assert.deepEqual(tg.sentTo(509).map((m) => m.params.text), ["Ответ 1", "Ответ 2"]);
+  assert.deepEqual(
+    an.requests[1].body.messages.map((m) => [m.role, m.content]),
+    [
+      ["user", "Сколько стоит стрижка?"],
+      ["assistant", "Ответ 1"],
+      ["user", "И борода тоже"],
+    ]
+  );
+});
+
+test("после перезапуска бот отвечает тем, кому не успел ответить", async () => {
+  const before = await makeApp();
+  // Сообщение пришло, а ответить бот не успел (процесс перезапустили)
+  const fresh = before.getConv({ kind: "direct", chatId: 510 }, user(510));
+  before.pushMessage(fresh, { role: "client", text: "Есть время сегодня?", mid: 1 });
+  fresh.lastClientAt = clock;
+  // Без ответа больше часа — уже не трогаем
+  const stale = before.getConv({ kind: "direct", chatId: 511 }, user(511));
+  before.pushMessage(stale, { role: "client", text: "Привет", mid: 1 });
+  stale.lastClientAt = clock - 2 * 3600000;
+  before.store.flush();
+
+  an.respond = () => confident("Да, сегодня есть 15:00 и 17:30.");
+  const after = await makeApp({ dataFile: before.cfg.dataFile });
+  await after.idle();
+  assert.equal(tg.sentTo(510).at(-1)?.params.text, "Да, сегодня есть 15:00 и 17:30.");
+  assert.equal(tg.sentTo(511).length, 0);
+  assert.equal(an.requests.length, 1);
 });
 
 // ---------- передача мастеру ----------
@@ -564,4 +605,32 @@ test("защита от спама: после лимита бот зовёт м
   }
   assert.equal(an.requests.length, 2);
   assert.match(tg.sentTo(OWNER).at(-1).params.text, /слишком часто/);
+});
+
+test("кнопки мастера не задерживают другие сообщения, пока бот думает или «печатает»", async () => {
+  const app = await makeApp();
+  app.cfg.typing = { ...app.cfg.typing, minMs: 400, maxMs: 400 };
+  an.respond = () => final({ reply: "Черновик ответа", confidence: 0.3, handoff: false, handoff_reason: "" });
+  await clientSays(app, 542, "Можно с ребёнком?");
+  await app.idle();
+  const conv = lastConv(app);
+  assert.equal(conv.status, "waiting");
+
+  let t = Date.now();
+  await press(app, `c:send:${conv.id}`);
+  assert.ok(Date.now() - t < 300, "отправка черновика не держит обработку апдейтов");
+  await app.idle();
+  assert.equal(tg.sentTo(542).at(-1).params.text, "Черновик ответа");
+  assert.equal(conv.status, "bot");
+
+  // «Бот, попробуй ещё» ждёт ИИ в фоне
+  an.respond = () => final({ reply: "", confidence: 0.9, handoff: true, handoff_reason: "клиент просит мастера" });
+  await clientSays(app, 542, "Позовите мастера");
+  await app.idle();
+  an.respond = () => ({ delayMs: 600, response: confident("Мастер скоро ответит 🙂") });
+  t = Date.now();
+  await press(app, `c:retry:${conv.id}`);
+  assert.ok(Date.now() - t < 300, "повтор не держит обработку апдейтов");
+  await app.idle();
+  assert.equal(tg.sentTo(542).at(-1).params.text, "Мастер скоро ответит 🙂");
 });
