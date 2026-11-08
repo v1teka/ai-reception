@@ -5,7 +5,7 @@ const { nowParts, addDays, fmtTime, parseTime, minutesUntil } = require("../bot/
 const { normalizeShop, demoShop, fromLlmShop, toLlmShop } = require("../bot/shop");
 const { freeStarts, findFreeSlots, createBooking, cancelBooking, demoBusy } = require("../bot/schedule");
 const { typingDuration, splitReply } = require("../bot/typing");
-const { extractYandexUrl, parseOrgId, htmlToText, looksLikeCaptcha } = require("../bot/yandex");
+const { extractYandexUrl, parseOrgId, htmlToText, looksLikeCaptcha, fetchOrgText } = require("../bot/yandex");
 const { buildMessages } = require("../bot/assistant");
 
 // Четверг, 5 ноября 2026, 13:00 по Москве
@@ -118,6 +118,58 @@ test("ссылки Яндекс.Карт и текст страницы", () => 
   assert.ok(!text.includes("var x"));
   assert.ok(text.includes("Пн – Пт"));
   assert.ok(looksLikeCaptcha("https://yandex.ru/showcaptcha?retpath=…", ""));
+
+  // Старый домен maps.yandex.ru
+  assert.equal(extractYandexUrl("наша точка: https://maps.yandex.ru/org/barbershop/1234567890/."), "https://maps.yandex.ru/org/barbershop/1234567890/");
+  assert.equal(extractYandexUrl("https://maps.yandex.ru/-/CDb~aBcD"), "https://maps.yandex.ru/-/CDb~aBcD");
+  assert.equal(extractYandexUrl("https://maps.yandex.com.tr/org/x/123456/"), "https://maps.yandex.com.tr/org/x/123456/");
+  assert.equal(parseOrgId("https://maps.yandex.ru/org/barbershop/1234567890/"), "1234567890");
+  assert.equal(extractYandexUrl("https://maps.yandex.ru.evil.example/org/1/"), null);
+  assert.equal(extractYandexUrl("https://yandex.ru/search/?text=барбершоп"), null);
+});
+
+function logSpy() {
+  const lines = [];
+  const add = (level) => (...a) => lines.push(`${level} ${a.join(" ")}`);
+  return { lines, info: add("info"), warn: add("warn"), error: add("error") };
+}
+
+test("загрузка карточки: в логе и в итоге видны статус, итоговый адрес и капча", async () => {
+  const log = logSpy();
+  const captcha = await fetchOrgText("https://yandex.ru/maps/org/x/123456789/", {
+    log,
+    fetchImpl: async () => ({ status: 200, url: "https://yandex.ru/showcaptcha?cc=1&retpath=x", text: async () => "<div>SmartCaptcha</div>" }),
+  });
+  assert.equal(captcha.ok, false);
+  assert.match(captcha.reason, /капчу/);
+  assert.equal(captcha.pages.length, 1);
+  assert.equal(captcha.pages[0].status, 200);
+  assert.equal(captcha.pages[0].finalUrl, "https://yandex.ru/showcaptcha?cc=1&retpath=x");
+  assert.equal(captcha.pages[0].captcha, true);
+  assert.equal(log.lines.length, 1);
+  assert.match(log.lines[0], /^warn .*HTTP 200.*итоговый адрес https:\/\/yandex\.ru\/showcaptcha.*капча/);
+
+  // Сетевая ошибка: настоящая причина из e.cause, а не просто «fetch failed»
+  const offline = await fetchOrgText("https://yandex.ru/maps/org/x/123456789/", {
+    log,
+    fetchImpl: async () => {
+      throw Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("getaddrinfo ENOTFOUND yandex.ru"), { code: "ENOTFOUND" }) });
+    },
+  });
+  assert.equal(offline.reason, "не удалось открыть страницу (fetch failed: ENOTFOUND)");
+
+  // Успех после редиректа: карточка и цены, оба запроса в логе
+  log.lines.length = 0;
+  const html = `<html><body><h1>Барбершоп</h1><div>${"Стрижка 1 500 ₽. ".repeat(20)}</div></body></html>`;
+  const ok = await fetchOrgText("https://yandex.ru/maps/-/abc", {
+    log,
+    fetchImpl: async (url) => ({ status: 200, url: /prices/.test(url) ? url : "https://yandex.ru/maps/org/barbershop/1234567890/", text: async () => html }),
+  });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(ok.pages.map((p) => p.what), ["Карточка", "Вкладка «Цены»"]);
+  assert.equal(ok.pages[1].url, "https://yandex.ru/maps/org/barbershop/1234567890/prices/");
+  assert.equal(log.lines.length, 2);
+  assert.match(log.lines[0], /^info .*maps\/-\/abc → Карточка: HTTP 200, \d+ (?:Б|КБ), итоговый адрес https:\/\/yandex\.ru\/maps\/org\/barbershop\/1234567890\//);
 });
 
 test("точка: слоты из длительности, стабильные id, формат для ИИ туда-обратно", () => {

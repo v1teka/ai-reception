@@ -1,8 +1,9 @@
 // Настройка точки силами ИИ: импорт с Яндекс.Карт и правки словами/скриншотами.
 // Результат всегда — предложение (черновик), мастер подтверждает его кнопкой.
 const { textOf, parseJson, LlmError } = require("./llm");
+const { truncate } = require("./util");
 const { LLM_SHOP_SCHEMA, toLlmShop, fromLlmShop, emptyShop } = require("./shop");
-const { fetchOrgText } = require("./yandex");
+const { fetchOrgText, describeFetch, parseOrgId, looksLikeCaptcha } = require("./yandex");
 
 const SETUP_SYSTEM = `Ты помогаешь мастеру барбершопа (или салона) настроить онлайн-администратора в Telegram. Верни данные точки строго по JSON-схеме.
 
@@ -23,8 +24,28 @@ function images(list) {
   }));
 }
 
+// Что ИИ открывал через web_fetch и что получил: ошибки этого инструмента приходят
+// не исключением, а блоком web_fetch_tool_result с error_code
+function webFetchLog(content) {
+  const asked = {};
+  const out = [];
+  for (const b of content || []) {
+    if (b.type === "server_tool_use" && b.name === "web_fetch") asked[b.id] = b.input?.url;
+    if (b.type !== "web_fetch_tool_result") continue;
+    const c = b.content || {};
+    const url = c.url || asked[b.tool_use_id] || "адрес неизвестен";
+    if (c.type === "web_fetch_tool_result_error") out.push(`${url} → ошибка ${c.error_code}`);
+    else {
+      const data = typeof c.content?.source?.data === "string" ? c.content.source.data : "";
+      out.push(`${url} → ${looksLikeCaptcha(url, data) ? "капча" : "открыта"}`);
+    }
+  }
+  return out;
+}
+
 async function askForShop({ llm, cfg, content, tools, base }) {
   const messages = [{ role: "user", content }];
+  const fetched = [];
   for (let step = 0; step < 4; step++) {
     const resp = await llm.create(
       {
@@ -36,32 +57,42 @@ async function askForShop({ llm, cfg, content, tools, base }) {
       },
       { timeoutMs: cfg.setupTimeoutMs }
     );
+    fetched.push(...webFetchLog(resp.content));
     if (resp.stop_reason === "pause_turn") {
       messages.push({ role: "assistant", content: resp.content });
       continue;
     }
-    if (resp.stop_reason === "refusal") return { ok: false, reason: "ИИ отказался обрабатывать эти данные" };
+    if (resp.stop_reason === "refusal") return { ok: false, reason: "ИИ отказался обрабатывать эти данные", fetched };
     const out = parseJson(textOf(resp));
-    if (!out || !Array.isArray(out.services)) return { ok: false, reason: "ИИ вернул данные в неожиданном формате" };
-    return { ok: true, shop: fromLlmShop(out, base), changes: Array.isArray(out.changes) ? out.changes : [] };
+    if (!out || !Array.isArray(out.services)) return { ok: false, reason: "ИИ вернул данные в неожиданном формате", fetched };
+    return { ok: true, shop: fromLlmShop(out, base), changes: Array.isArray(out.changes) ? out.changes : [], fetched };
   }
-  return { ok: false, reason: "ИИ не закончил разбор" };
+  return { ok: false, reason: "ИИ не закончил разбор", fetched };
 }
 
 async function safe(fn) {
   try {
     return await fn();
   } catch (e) {
-    if (e instanceof LlmError) return { ok: false, reason: e.reason };
+    // detail — исходный текст ошибки API, для владельца бота
+    if (e instanceof LlmError) return { ok: false, reason: e.reason, detail: e.cause?.message ? truncate(String(e.cause.message), 300) : "" };
     throw e;
   }
 }
 
 // Импорт новой точки по ссылке на Яндекс.Карты.
+// При неудаче: reason — главная причина, details — что произошло на каждом шаге.
+// Это техническая информация для владельца бота, мастеру её не показываем.
 async function importFromYandex({ llm, cfg, url, prevShop, fetchImpl, log = console }) {
   const base = { ...emptyShop(prevShop), yandexUrl: url };
-  const page = await fetchOrgText(url, { fetchImpl });
+  const details = [];
+  const page = await fetchOrgText(url, { fetchImpl, log });
+  details.push(...page.pages.map(describeFetch));
+  let reason = page.reason;
   if (page.ok) {
+    if (!parseOrgId(page.url) && !parseOrgId(url)) {
+      details.push("В ссылке нет номера организации: похоже, это ссылка на карту или поиск, а не на карточку");
+    }
     const r = await safe(() =>
       askForShop({
         llm,
@@ -70,10 +101,10 @@ async function importFromYandex({ llm, cfg, url, prevShop, fetchImpl, log = cons
         content: `slot_minutes по умолчанию: ${base.slotMinutes}.\nНиже текст страницы организации с Яндекс.Карт (и вкладки «Цены», если она есть). Собери из него данные точки.\n\n${page.text}`,
       })
     );
-    if (r.ok && r.shop.name) return { ...r, via: "page" };
-    log.warn("Импорт со страницы не удался:", r.reason || "пустое название");
-  } else {
-    log.warn("Страница Яндекс.Карт недоступна:", page.reason);
+    if (r.ok && r.shop.name) return { ...r, via: "page", details };
+    const why = r.ok ? "ИИ не нашёл на странице название организации" : r.reason;
+    details.push(`Разбор страницы ИИ: ${why}${r.detail ? ` (${r.detail})` : ""}`);
+    reason = `не получилось разобрать карточку (${why})`;
   }
 
   // Запасной путь: страницу откроет сам ИИ через web_fetch
@@ -87,9 +118,18 @@ async function importFromYandex({ llm, cfg, url, prevShop, fetchImpl, log = cons
         content: `slot_minutes по умолчанию: ${base.slotMinutes}.\nОткрой карточку организации на Яндекс.Картах и её вкладку с ценами (обычно адрес карточки + "prices/"), затем собери данные точки. Если страница не открылась или там капча — верни пустые поля.\n\nСсылка: ${url}`,
       })
     );
-    if (r.ok && r.shop.name) return { ...r, via: "web_fetch" };
+    if (r.ok && r.shop.name) {
+      log.warn("Импорт с Яндекс.Карт прошёл только через web_fetch:", url, "\n" + details.join("\n"));
+      return { ...r, via: "web_fetch", details };
+    }
+    const why = r.ok ? "ИИ не получил данных со страницы" : r.reason;
+    const more = [r.detail, ...(r.fetched || [])].filter(Boolean);
+    details.push(`Запасной путь (ИИ сам открывает ссылку): ${why}${more.length ? `; ${more.join("; ")}` : ""}`);
+  } else {
+    details.push("Запасной путь (ИИ сам открывает ссылку): выключен (YANDEX_WEB_FETCH=off)");
   }
-  return { ok: false, reason: page.ok ? "не получилось разобрать карточку" : page.reason };
+  log.warn("Импорт с Яндекс.Карт не удался:", url, "\n" + details.join("\n"));
+  return { ok: false, reason, details };
 }
 
 // Правка словами или скриншотами: «по воскресеньям выходной», «стрижка теперь 2000», фото прайса.
