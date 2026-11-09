@@ -14,15 +14,21 @@ const {
 const REPLY_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["reply", "confidence", "handoff", "handoff_reason"],
+  required: ["reply", "confidence", "handoff", "handoff_reason", "hold"],
   properties: {
     reply: {
       type: "string",
-      description: "Сообщение клиенту. Если нужен мастер — черновик ответа для мастера (можно пустую строку).",
+      description:
+        "Сообщение клиенту — коротко, как пишет живой администратор в мессенджере. Если нужен мастер — черновик ответа для мастера (можно пустую строку).",
     },
     confidence: { type: "number", description: "От 0 до 1: насколько ответ опирается на данные точки и результаты инструментов" },
     handoff: { type: "boolean", description: "true, если переписку нужно передать мастеру" },
     handoff_reason: { type: "string", description: "Коротко, почему нужен мастер; пустая строка, если не нужен" },
+    hold: {
+      type: "string",
+      description:
+        "Если нужен мастер — что написать клиенту прямо сейчас: коротко и по-человечески, что уточнишь и скоро ответишь. Иначе пустая строка.",
+    },
   },
 };
 
@@ -89,39 +95,77 @@ function stablePrompt(shop) {
   return `Ты — онлайн-администратор точки «${shop.name || "барбершоп"}» в Telegram. Отвечаешь клиентам 24/7: про услуги, цены, мастеров, адрес и график, подбираешь свободное время и записываешь. Это живой чат: отвечай сразу, без долгих размышлений.
 
 Как писать:
-- Как хороший администратор в мессенджере: коротко (обычно 1–3 предложения), тепло, по делу, на «вы».
+- Как живой администратор в мессенджере: коротко, тепло, по делу, на «вы». Обычно одно-два коротких предложения.
+- Отвечай на то, что спросили. Подробности — состав услуги, правила, условия — добавляй, только если о них спросили или без них не обойтись.
+- Без вступлений и дежурных фраз: не повторяй вопрос, не пиши «отличный вопрос», «с радостью подскажу», «если будут вопросы — пишите». Здоровайся только в ответ на приветствие или в начале разговора.
+- В конце — не больше одного короткого вопроса, и только если он помогает записаться.
 - Эмодзи — не больше одного и не в каждом сообщении.
 - Без markdown: никаких звёздочек, решёток и списков с дефисами. Варианты времени перечисляй через запятую.
 - Отвечай на языке клиента.
 - Не называй себя ботом без повода. Если клиент прямо спрашивает, с роботом ли он общается, честно скажи, что ты онлайн-помощник точки и мастер может подключиться к переписке.
+- Клиент может написать несколько сообщений, не дожидаясь ответа. Отвечай на всё разом, как живой человек: если новое сообщение уточняет или меняет прежнее — отвечай на итоговый вопрос; если вопросы разные — ответь на каждый по порядку, можно отдельными сообщениями через пустую строку.
+
+Например, клиент спросил только цену услуги (в угловых скобках — то, что берётся из данных точки):
+Слишком длинно: «Здравствуйте! <Услуга> у нас стоит <цена>, в неё входит <состав>, по времени <длительность>. Если хотите, могу подобрать удобное время — на какой день вас записать? 😊»
+Хорошо: «<Услуга> — <цена>. Записать вас?»
 
 Запись:
-- Свободное время узнавай только через get_free_slots и никогда не придумывай его. Если клиент назвал день — смотри с этого дня; если нет — предложи 2–4 ближайших варианта.
+- Свободное время узнавай только через get_free_slots и никогда не придумывай его. Если клиент назвал день — смотри с этого дня; если нет — предложи 2–3 ближайших варианта.
 - Услуга занимает несколько слотов подряд (обычно от 1 до 4), инструменты это учитывают сами — просто передавай id услуги.
 - Если непонятно, какая услуга нужна, уточни одним вопросом.
 - Для записи нужны услуга, дата и время из свободных и имя. Телефон попроси, но если клиент не хочет — записывай без него.
-- Когда всё известно и клиент согласился на конкретное время — вызывай create_booking. Потом подтверди одной фразой: услуга, день и время, мастер, адрес.
+- Когда всё известно и клиент согласился на конкретное время — вызывай create_booking. Потом подтверди одной короткой фразой: услуга, день и время, мастер, адрес.
 - Перенос: cancel_booking старой записи и create_booking новой. Отмена — cancel_booking.
 
 Когда звать мастера (handoff = true):
 - клиент просит живого человека или мастера, жалуется, недоволен;
 - в данных ниже нет ответа и пришлось бы выдумывать факт о точке;
 - нестандартное: скидки и торг, особые условия, здоровье (аллергия, раздражение кожи), группа людей, просьба, которую решает только мастер;
+- клиент ссылается на договорённость с мастером или владельцем, которой нет в данных;
 - сообщение непонятно.
-Тогда в handoff_reason коротко напиши причину, а в reply — черновик ответа, который мастер сможет отправить одним нажатием (или пустую строку).
+Тогда в handoff_reason коротко напиши причину, в reply — черновик ответа, который мастер сможет отправить одним нажатием (или пустую строку), а в hold — что клиент получит прямо сейчас, чтобы не ждать в тишине: коротко и по-человечески, что уточнишь и скоро ответишь (на жалобу или просьбу позвать человека — по ситуации). Если на часть вопроса ответ есть в данных, его можно дать в hold сразу. Ничего не выдумывай и не обещай сроков. Если мастер не нужен — hold пустой.
 
 confidence (от 0 до 1):
 - 0.9–1 — ответ прямо следует из данных точки или результатов инструментов;
 - 0.6–0.8 — уточняющий вопрос, приветствие, small talk, общий ответ без новых фактов о точке;
 - ниже 0.5 — пришлось догадываться или ответа в данных нет.
 
-Итог каждого хода — JSON по схеме: reply, confidence, handoff, handoff_reason.
+Итог каждого хода — JSON по схеме: reply, confidence, handoff, handoff_reason, hold. Если мастер не нужен, reply не пустой: даже на «спасибо» или «ок» ответь парой слов, как ответил бы человек.
 
 Данные точки:
 ${renderForPrompt(shop)}`;
 }
 
-function dynamicPrompt({ shop, conv, state, now }) {
+// Пометка неотправленного ответа в истории для ИИ (см. buildMessages)
+const UNSENT = "[не отправлено]";
+
+// Хвост переписки, на который бот ещё не ответил по существу, по порядку: сообщения клиента и то,
+// что ответом не считается, — «уточню и скоро отвечу» (hold) и напоминания (notice).
+// Служебные (/start) пропускаем. since — начало текущего разговора: то, что было до
+// «Завершить диалог», в новый разговор не тянем.
+function unansweredTail(messages, since = 0) {
+  const out = [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.at < since) break;
+    if (m.service) continue;
+    if (m.role !== "client" && !m.hold && !m.notice) break;
+    out.unshift(m);
+  }
+  return out;
+}
+
+// «Уточню» и напоминания в самом конце — после них клиент ещё ничего не писал
+function trailingAsides(messages) {
+  const tail = unansweredTail(messages);
+  let i = tail.length;
+  while (i > 0 && tail[i - 1].role !== "client") i--;
+  return tail.slice(i);
+}
+
+// draft — ответ, который бот не отправил, потому что клиент дописал: { text, after } (см. App.processConv).
+// Сообщения клиента в системный промпт не цитируем: там они звучали бы как правила точки.
+function dynamicPrompt({ shop, conv, state, now, draft = null }) {
   const cur = nowParts(shop.timezone, now);
   const days = [];
   for (let i = 0; i < Math.min(shop.bookingDays, 14); i++) {
@@ -142,12 +186,42 @@ function dynamicPrompt({ shop, conv, state, now }) {
           .join("; ")}.`
       : "Предстоящих записей у клиента нет.",
   ];
+  if (conv.kind === "business") {
+    lines.push(
+      "Переписка идёт в личном Telegram мастера: клиент пишет ему напрямую, и отвечаешь ты от его имени. Поэтому в hold не пиши «позову мастера» или «передам мастеру» — пиши от первого лица: «уточню и скоро отвечу»."
+    );
+  }
+  // «Уточню» и напоминания, после которых бот ещё не отвечал по существу. Клиент их видел, но ответом
+  // они не были — даже если после них он написал ещё (тогда они остаются и в истории).
+  const asides = unansweredTail(conv.messages, conv.session?.startedAt)
+    .filter((m) => m.role !== "client")
+    .map((m) => `«${m.text.replace(/[«»]/g, '"').replace(/\s+/g, " ")}»`);
+  if (asides.length) {
+    lines.push(
+      `Клиенту уже ушло: ${asides.join(", ")}. Это не ответ по существу: не повторяй это и ответь на всё, что в переписке осталось без ответа.`
+    );
+  }
+  if (draft?.text) {
+    lines.push(
+      "",
+      `Твоё сообщение с пометкой ${UNSENT} клиент не видел: пока ты его печатал, клиент написал ещё. Поступи как живой человек: если тот ответ всё ещё верен и к месту — повтори его без пометки и без изменений, а ответ на новое, если он нужен, допиши после пустой строки; если новое сообщение уточняет или меняет вопрос — ответь заново. Если на новое нужен мастер, напиши в hold то, что из того ответа ещё верно, и что остальное уточнишь.`
+    );
+  }
   return lines.join("\n");
 }
 
 // История разговора в формате Messages API (только текст, без старых thinking-блоков).
-function buildMessages(conv, limit = 30) {
+// «Уточню» и напоминания в самом конце не передаём: ответ должен идти за вопросом клиента
+// (их ИИ увидит в dynamicPrompt). Неотправленный ответ (draft) ставим туда, где он был бы, —
+// перед тем, что клиент дописал, пока бот его печатал, — с пометкой UNSENT.
+function buildMessages(conv, { limit = 30, draft = null } = {}) {
   const items = conv.messages.filter((m) => !m.service).slice(-limit);
+  items.splice(items.length - trailingAsides(items).length);
+  if (draft?.text && items.some((m) => m.role === "client" && m.seq > draft.after)) {
+    let i = items.length;
+    while (i > 0 && items[i - 1].role === "client" && items[i - 1].seq > draft.after) i--;
+    items.splice(i, 0, { role: "bot", text: `${UNSENT} ${draft.text}` });
+  }
   const out = [];
   for (const m of items) {
     const role = m.role === "client" ? "user" : "assistant";
@@ -216,16 +290,17 @@ function runTool(name, input, ctx) {
 }
 
 // Один ход ассистента. Никогда не бросает: возвращает reply / handoff / error.
-async function generateReply({ llm, cfg, state, shop, conv, now = Date.now(), log = console }) {
+// У handoff, который решила модель, есть hold — что сразу написать клиенту (может быть пустым).
+async function generateReply({ llm, cfg, state, shop, conv, draft = null, now = Date.now(), log = console }) {
   const effects = [];
   const deadline = Date.now() + cfg.llmTimeoutMs;
-  const messages = buildMessages(conv);
+  const messages = buildMessages(conv, { draft });
   if (!messages.length || messages[messages.length - 1].role !== "user") {
     return { kind: "error", reason: "нечего отвечать", effects };
   }
   const system = [
     { type: "text", text: stablePrompt(shop), cache_control: { type: "ephemeral" } },
-    { type: "text", text: dynamicPrompt({ shop, conv, state, now }) },
+    { type: "text", text: dynamicPrompt({ shop, conv, state, now, draft }) },
   ];
 
   try {
@@ -274,16 +349,27 @@ async function generateReply({ llm, cfg, state, shop, conv, now = Date.now(), lo
         return { kind: "error", reason: "ИИ вернул ответ в неожиданном формате", effects };
       }
       const confidence = Math.max(0, Math.min(1, Number(out.confidence) || 0));
-      const reply = out.reply.trim();
+      const clean = (t) => t.replaceAll(UNSENT, "").trim(); // ИИ мог повторить пометку вместе с ответом
+      const reply = clean(out.reply);
+      // Слишком длинное «уточню» — не то, о чём просили: тогда бот возьмёт короткую фразу по умолчанию
+      const hold = typeof out.hold === "string" && clean(out.hold).length <= 400 ? clean(out.hold) : "";
       if (out.handoff) {
-        return { kind: "handoff", reason: out.handoff_reason || "бот просит помощи мастера", draft: reply, confidence, effects };
+        return { kind: "handoff", reason: out.handoff_reason || "бот просит помощи мастера", draft: reply, hold, confidence, effects };
       }
-      if (!reply) return { kind: "handoff", reason: "бот не нашёл, что ответить", draft: "", confidence, effects };
+      // Мастера позвал сам бот, а не ИИ. Фразу ИИ клиенту не отправляем — в ней может быть та же
+      // догадка, — бот напишет свою, без фактов.
+      if (!reply) {
+        // Пустой ответ при уверенности — ИИ решил, что отвечать нечего («ок», смайлик): «уточню» было бы
+        // не к месту, мастер просто увидит карточку. Без уверенности — не знает ответа, как и ниже.
+        const unsure = confidence < cfg.confidenceThreshold;
+        return { kind: "handoff", reason: "бот не нашёл, что ответить", draft: "", ...(unsure ? { hold: "" } : {}), confidence, effects };
+      }
       if (confidence < cfg.confidenceThreshold) {
         return {
           kind: "handoff",
           reason: `бот не уверен в ответе (${Math.round(confidence * 100)}%)${out.handoff_reason ? `: ${out.handoff_reason}` : ""}`,
           draft: reply,
+          hold: "",
           confidence,
           effects,
         };
@@ -298,4 +384,4 @@ async function generateReply({ llm, cfg, state, shop, conv, now = Date.now(), lo
   }
 }
 
-module.exports = { generateReply, buildMessages, runTool, TOOLS, REPLY_SCHEMA, stablePrompt, dynamicPrompt };
+module.exports = { generateReply, buildMessages, unansweredTail, runTool, TOOLS, REPLY_SCHEMA, stablePrompt, dynamicPrompt };

@@ -1,12 +1,29 @@
 // Ядро бота: маршрутизация апдейтов, разговоры с клиентами, ответы ИИ,
 // передача мастеру, Telegram Business, напоминания. Панель мастера — в console.js.
-const { generateReply } = require("./assistant");
+const { generateReply, unansweredTail } = require("./assistant");
 const { typingDuration, splitReply } = require("./typing");
 const { upcomingBookings, bookingLabel, minutesUntilStart } = require("./schedule");
 const { nowParts } = require("./time");
 const { esc, truncate, sleep: realSleep, randomCode, userName } = require("./util");
 
 const HOUR = 3600000;
+
+// Что написать клиенту, когда бот зовёт мастера, а ИИ сам фразу не предложил
+const HOLD_TEXT = "Уточню и скоро вам отвечу";
+
+// Вложения, которые бот не разбирает: поле сообщения, как назвать мастеру и что ответить клиенту сразу
+const MEDIA = [
+  ["photo", "фото", "Посмотрю и скоро отвечу"],
+  ["voice", "голосовое", "Послушаю и скоро отвечу"],
+  ["video_note", "видеосообщение", "Посмотрю и скоро отвечу"],
+  ["video", "видео", "Посмотрю и скоро отвечу"],
+  ["audio", "аудио", "Послушаю и скоро отвечу"],
+  // У гифки Telegram заполняет и document, поэтому она раньше файла.
+  // Гифка — обычно реакция, обещать «посмотрю» странно.
+  ["animation", "гифку", ""],
+  ["document", "файл", "Посмотрю и скоро отвечу"],
+];
+const MEDIA_HOLD = Object.fromEntries(MEDIA.map(([, label, hold]) => [label, hold]));
 
 class App {
   constructor({ cfg, store, api, consoleApi, llm, log = console, now = () => Date.now(), sleep = realSleep, fetchImpl }) {
@@ -22,6 +39,7 @@ class App {
     this.fetchImpl = fetchImpl;
     this.timers = new Map(); // id разговора -> таймер «дождаться, пока клиент допишет»
     this.busy = new Set(); // разговоры, по которым сейчас думает ИИ
+    this.holding = new Set(); // разговоры, где бот сейчас «печатает» «уточню и скоро отвечу»
     this.setupBuffers = new Map(); // id мастера -> накопленный ввод для настройки
     this.tasks = new Set();
     this.keyIndex = new Map();
@@ -63,8 +81,9 @@ class App {
     const now = this.now();
     let n = 0;
     for (const c of Object.values(this.state.conversations)) {
-      if (c.status !== "bot" || now - (c.lastClientAt || 0) > maxAgeMs) continue;
-      if (!this.pendingClientMessages(c).some((m) => !m.service)) continue;
+      // Завершённый диалог не поднимаем: следующий вопрос клиента начнёт новый разговор
+      if (c.status !== "bot" || c.session?.closed || now - (c.lastClientAt || 0) > maxAgeMs) continue;
+      if (!this.pendingClientMessages(c).length) continue;
       this.schedule(c.id);
       n++;
     }
@@ -235,20 +254,33 @@ class App {
     conv.msgCount = (conv.msgCount || conv.messages.length) + 1;
     const msgs = conv.messages;
     let i = msgs.length;
-    if (after != null) while (i > 0 && msgs[i - 1].role === "client" && msgs[i - 1].seq > after) i--;
+    for (let j = msgs.length; after != null && j > 0; j--) {
+      const p = msgs[j - 1];
+      // «уточню» и напоминания между сообщениями клиента не мешают: ответ встаёт перед первым из новых
+      if (p.seq <= after || (p.role !== "client" && !p.hold && !p.notice)) break;
+      if (p.role === "client") i = j - 1;
+    }
     msgs.splice(i, 0, { at: this.now(), seq: conv.msgCount, ...m });
     if (msgs.length > 100) msgs.splice(0, msgs.length - 100);
     conv.updatedAt = this.now();
   }
 
+  // Сообщения клиента без ответа в текущем разговоре. «Уточню и скоро отвечу» и напоминания
+  // ответом не считаются: вопрос по-прежнему ждёт мастера или новой попытки бота.
   pendingClientMessages(conv) {
-    const out = [];
-    for (let i = conv.messages.length - 1; i >= 0; i--) {
-      const m = conv.messages[i];
-      if (m.role !== "client") break;
-      out.unshift(m);
-    }
-    return out;
+    return unansweredTail(conv.messages, conv.session?.startedAt).filter((m) => m.role === "client");
+  }
+
+  // Клиенту уже пообещали «уточню и отвечу» на эти вопросы (или бот как раз это печатает) —
+  // второй раз не повторяем
+  holdSent(conv) {
+    return this.holding.has(conv.id) || unansweredTail(conv.messages, conv.session?.startedAt).some((m) => m.hold);
+  }
+
+  // Клиент написал что-то новое текстом после сообщения номер seq. Голосовое или фото ответ
+  // на прежний вопрос не меняют — их потом разберёт мастер.
+  wroteSince(conv, seq) {
+    return conv.messages.some((m) => m.role === "client" && !m.service && !m.needsHuman && m.seq > seq);
   }
 
   isOwnChat(conv, adminId) {
@@ -262,16 +294,7 @@ class App {
     if (msg.contact) return { text: `Мой телефон: ${msg.contact.phone_number}`, phone: msg.contact.phone_number };
     if (msg.sticker) return { text: `[стикер ${msg.sticker.emoji || ""}]`.replace(" ]", "]") };
     if (msg.location) return { text: "[отправил геолокацию]" };
-    const kinds = [
-      ["photo", "фото"],
-      ["voice", "голосовое"],
-      ["video_note", "видеосообщение"],
-      ["video", "видео"],
-      ["audio", "аудио"],
-      ["document", "файл"],
-      ["animation", "гифку"],
-    ];
-    for (const [field, label] of kinds) {
+    for (const [field, label] of MEDIA) {
       if (msg[field]) return { text: `[${label}]${caption}`, needsHuman: label };
     }
     return { text: "[сообщение]", needsHuman: "сообщение без текста" };
@@ -308,7 +331,7 @@ class App {
   greeting() {
     const s = this.shop;
     if (s.greeting) return s.greeting;
-    return `Здравствуйте! Это ${s.name || "наш барбершоп"} 💈 Подскажу по услугам и ценам и запишу на удобное время. Чем могу помочь?${
+    return `Здравствуйте! Это ${s.name || "наш барбершоп"} 💈 Подскажу по услугам и запишу на удобное время.${
       s.demo ? "\n\nЭто демо-версия: данные точки тестовые." : ""
     }`;
   }
@@ -334,46 +357,86 @@ class App {
     this.busy.add(id);
     let again = false;
     try {
+      // Ответ, который бот не отправил, потому что клиент дописал. ИИ увидит его в следующем круге
+      // и решит, как поступил бы человек: отправить и дописать про новое или ответить заново.
+      let draft = null;
+      // Следующий круг нового ответа не дал (сбой ИИ, лимит, вложение) — отправляем начатый как есть:
+      // на то, что клиент спросил раньше, он отвечал верно. false — дальше этот круг не идёт.
+      const flush = async (conv) => {
+        if (!draft) return true;
+        const { text, after } = draft;
+        draft = null;
+        const out = await this.deliver(conv, text, "bot", { after });
+        return !out.failed && conv.status === "bot";
+      };
       for (let round = 0; round < 4; round++) {
         const conv = this.conv(id);
         if (!conv || conv.status !== "bot") return;
-        const pending = this.pendingClientMessages(conv).filter((m) => !m.service);
+        const pending = this.pendingClientMessages(conv);
         if (!pending.length) return;
 
         const odd = pending.find((m) => m.needsHuman);
         if (odd) {
-          await this.handoff(conv, { reason: `клиент прислал ${odd.needsHuman} — бот такое не разбирает`, draft: "" });
+          if (!(await flush(conv))) return;
+          await this.handoff(conv, { reason: `клиент прислал ${odd.needsHuman} — бот такое не разбирает`, hold: MEDIA_HOLD[odd.needsHuman] || "" });
           return;
         }
 
         // Защита от спама: не больше LLM_CALLS_PER_HOUR ответов ИИ в час на одного клиента
         conv.llmCalls = (conv.llmCalls || []).filter((t) => this.now() - t < HOUR);
         if (conv.llmCalls.length >= this.cfg.llmCallsPerHour) {
-          await this.handoff(conv, { reason: "клиент пишет слишком часто — бот взял паузу", draft: "" });
+          if (!(await flush(conv))) return;
+          await this.handoff(conv, { reason: "клиент пишет слишком часто — бот взял паузу" });
           return;
         }
         conv.llmCalls.push(this.now());
 
         const seen = conv.msgCount;
-        const result = await generateReply({ llm: this.llm, cfg: this.cfg, state: this.state, shop: this.shop, conv, now: this.now(), log: this.log });
+        const result = await generateReply({ llm: this.llm, cfg: this.cfg, state: this.state, shop: this.shop, conv, draft, now: this.now(), log: this.log });
         for (const ef of result.effects) await this.onEffect(conv, ef);
         this.save();
         if (conv.status !== "bot") return; // мастер перехватил, пока ИИ думал
 
-        // Клиент дописал, пока ИИ думал, — ответ мог устареть; переспросим, если ничего не записали
-        if (conv.msgCount !== seen && !result.effects.length && round < 3) continue;
+        // Клиент дописал, пока ИИ думал или бот «печатал», — ответ мог устареть: не отправляем его,
+        // а переписываем с учётом нового. Если ИИ уже записал или отменил запись, ответ о сделанном
+        // уходит как есть, а новое бот разберёт следующим кругом. В последнем круге тоже отправляем как есть.
+        const canRedo = round < 3 && !result.effects.length;
+        const outdated = () => canRedo && this.wroteSince(conv, seen);
+        if (outdated()) {
+          // Новый ответ заменяет прежний черновик. Не ответил (сбой, нужен мастер) — прежний остаётся.
+          if (result.kind === "reply") draft = { text: result.text, after: seen };
+          continue;
+        }
 
-        if (result.kind !== "reply") {
+        if (result.kind === "error") {
+          // При сбое ИИ молчим: неизвестно, что именно клиент спросил и нужно ли ему что-то обещать
+          if (!(await flush(conv))) return;
+          await this.handoff(conv, { reason: result.reason, error: true });
+          return;
+        }
+        if (result.kind === "handoff") {
+          // ИИ сам написал «уточню»: неотправленный ответ он видел и что в нём ещё верно, перенёс туда.
+          // Иначе (не уверен, отказался, «уточню» на этот вопрос уже уходило) начатый ответ уходит как есть.
+          const ownHold = Boolean(result.hold) && !this.holdSent(conv);
+          const flushed = !ownHold && draft ? draft.text : "";
+          if (!ownHold && !(await flush(conv))) return;
+          // Черновик для мастера — только про новое: то, что уже ушло клиенту, второй раз не отправляем
+          let cardDraft = result.draft || "";
+          if (flushed && cardDraft.startsWith(flushed)) cardDraft = cardDraft.slice(flushed.length).trim();
           await this.handoff(conv, {
             reason: result.reason,
-            draft: result.draft || "",
+            draft: cardDraft,
             confidence: result.confidence,
-            error: result.kind === "error",
+            // ИИ не знает ответа — клиенту «уточню и скоро отвечу» (своими словами или стандартной фразой).
+            // Нет hold — ИИ отказался отвечать или ничего не написал: тогда молчим.
+            hold: result.hold == null ? "" : ownHold ? result.hold : HOLD_TEXT,
           });
           return;
         }
-        await this.deliver(conv, result.text, "bot", { after: seen });
-        // следующий круг подхватит то, что клиент написал, пока бот думал или «печатал»
+        const out = await this.deliver(conv, result.text, "bot", { after: seen, stopIf: outdated });
+        if (out.failed) return; // мастерам уже написали; не крутим ИИ впустую
+        draft = out.unsent ? { text: out.unsent, after: seen } : null;
+        // следующий круг ответит на то, что клиент написал, пока бот думал или «печатал»
       }
       again = true;
     } finally {
@@ -393,28 +456,39 @@ class App {
   }
 
   // В Telegram Business сообщение остаётся непрочитанным, пока мы сами не отметим его.
-  // Отмечаем только когда точно отвечаем.
-  async markRead(conv) {
+  // Отмечаем только то, на что отвечаем: сообщения клиента позже upTo (см. after в pushMessage)
+  // остаются непрочитанными — на них ответит следующий круг или мастер.
+  async markRead(conv, upTo = Infinity) {
     if (conv.kind !== "business" || !conv.unread.length) return;
-    const conn = this.conn(conv);
-    const lastId = conv.unread[conv.unread.length - 1];
-    conv.unread = [];
-    if (!conn?.rights?.can_read_messages) return;
+    const later = new Set(conv.messages.filter((m) => m.role === "client" && m.seq > upTo).map((m) => m.mid));
+    const read = conv.unread.filter((id) => !later.has(id));
+    if (!read.length) return;
+    conv.unread = conv.unread.filter((id) => later.has(id));
+    if (!this.conn(conv)?.rights?.can_read_messages) return;
     await this.api
-      .call("readBusinessMessage", { business_connection_id: conv.connId, chat_id: conv.chatId, message_id: lastId })
+      .call("readBusinessMessage", { business_connection_id: conv.connId, chat_id: conv.chatId, message_id: read[read.length - 1] })
       .catch((e) => this.log.warn("readBusinessMessage:", e.message));
   }
 
-  async typing(conv, ms) {
+  // «Печатает…» ms миллисекунд. stopIf — бросить на полуслове (клиент дописал): тогда вернёт false.
+  async typing(conv, ms, stopIf = null) {
     let left = ms;
     while (left > 0) {
+      if (stopIf?.()) return false;
       await this.api
         .call("sendChatAction", { chat_id: conv.chatId, action: "typing", ...this.transportExtra(conv) })
         .catch((e) => this.log.warn("sendChatAction:", e.message));
-      const step = Math.min(left, 4500); // статус живёт ~5 секунд
-      await this.sleep(step);
-      left -= step;
+      let chunk = Math.min(left, 4500); // статус живёт ~5 секунд
+      left -= chunk;
+      // Пока печатаем, несколько раз в секунду смотрим, не дописал ли клиент
+      while (chunk > 0) {
+        const step = stopIf ? Math.min(chunk, 250) : chunk;
+        await this.sleep(step);
+        chunk -= step;
+        if (stopIf?.()) return false;
+      }
     }
+    return true;
   }
 
   async sendToClient(conv, text) {
@@ -428,40 +502,64 @@ class App {
 
   // Ответ бота: прочитать → «печатает» пропорционально длине → отправить. Длинный ответ — частями.
   // after — см. pushMessage; по умолчанию ответ относится ко всему, что было до начала отправки.
-  async deliver(conv, text, role = "bot", { after = conv.msgCount } = {}) {
+  // hold — «уточню и скоро отвечу», пока диалог ждёт мастера; notice — напоминание о записи: уходит,
+  // даже если диалог ведёт мастер. Ни то ни другое не ответ по существу, поэтому сообщения клиента
+  // бот прочитанными не отмечает (это сделает тот, кто ответит).
+  // stopIf — бросить устаревший ответ, если клиент дописал: вернёт неотправленный остаток в unsent.
+  // Сбой отправки — { failed: true }, мастерам уже написали. Мастер перехватил диалог, пока бот
+  // «печатал», — { stopped: true, sent: сколько частей успело уйти }.
+  async deliver(conv, text, role = "bot", { after = conv.msgCount, hold = false, notice = false, stopIf = null } = {}) {
     const parts = splitReply(text);
-    if (!parts.length) return;
-    await this.markRead(conv);
+    if (!parts.length) return {};
+    if (!hold && !notice) await this.markRead(conv, after);
+    // Бот пишет, только пока диалог у него (а «уточню» — пока диалог ждёт мастера)
+    const mayGo = () => notice || role !== "bot" || conv.status === (hold ? "waiting" : "bot");
+    const flags = hold ? { hold: true } : notice ? { notice: true } : {};
     for (let i = 0; i < parts.length; i++) {
       if (i > 0) await this.sleep(this.cfg.typing.pauseMs);
-      await this.typing(conv, typingDuration(parts[i], this.cfg.typing));
-      if (role === "bot" && conv.status !== "bot") return; // мастер перехватил на полуслове
+      const typed = await this.typing(conv, typingDuration(parts[i], this.cfg.typing), stopIf);
+      if (!mayGo()) {
+        this.save(); // первые части могли уйти
+        return { stopped: true, sent: i }; // мастер перехватил на полуслове
+      }
+      if (!typed || stopIf?.()) {
+        this.save(); // первые части могли уйти
+        return { unsent: parts.slice(i).join("\n\n") };
+      }
       try {
         const sent = await this.sendToClient(conv, parts[i]);
-        this.pushMessage(conv, { role, text: parts[i], mid: sent?.message_id }, { after });
+        this.pushMessage(conv, { role, text: parts[i], mid: sent?.message_id, ...flags }, { after });
         conv.lastReplyAt = this.now();
       } catch (e) {
         this.log.error("Не удалось отправить клиенту:", e.message);
+        this.save();
         await this.notifyAdmins(
           `⚠️ Не удалось отправить сообщение клиенту <b>${esc(conv.client.name)}</b>: ${esc(e.message)}`,
           [[{ text: "📜 Переписка", callback_data: `c:open:${conv.id}` }]]
         );
-        break;
+        return { failed: true };
       }
     }
     this.save();
+    return {};
   }
 
   // ---------- передача мастеру ----------
 
-  async handoff(conv, { reason, draft = "", confidence = null, error = false }) {
+  // hold — что сразу написать клиенту («уточню и скоро отвечу»), чтобы он не ждал в тишине.
+  // Пустая строка — бот молчит (например, при сбое ИИ).
+  async handoff(conv, { reason, draft = "", confidence = null, error = false, hold = "" }) {
     this.cancelScheduled(conv.id);
+    // Одного «уточню» на вопрос хватает: после «Бот, попробуй ещё» второй раз не обещаем
+    const holdText = hold && !this.holdSent(conv) ? hold : "";
+    if (holdText) this.holding.add(conv.id); // сразу: пока это «уточню» не ушло, второе не начинаем
     conv.status = "waiting";
     conv.handoff = {
       reason,
       draft,
       confidence,
       error,
+      hold: holdText,
       at: this.now(),
       question: this.pendingClientMessages(conv)
         .map((m) => m.text)
@@ -469,7 +567,16 @@ class App {
     };
     this.save();
     this.log.info(`→ мастеру: разговор ${conv.id} (${reason})`);
-    await this.notifyHandoff(conv);
+    await this.notifyHandoff(conv).catch((e) => this.log.error("Карточка мастеру:", e));
+    // «Печатает…» идёт в фоне: если мастер успеет ответить или нажать кнопку, «уточню» не уйдёт
+    if (!holdText) return;
+    this.run(async () => {
+      try {
+        await this.deliver(conv, holdText, "bot", { hold: true });
+      } finally {
+        this.holding.delete(conv.id);
+      }
+    });
   }
 
   async onEffect(conv, ef) {
@@ -504,24 +611,46 @@ class App {
 
   // ---------- мастер пишет клиенту ----------
 
-  async takeover(conv, adminId, { quiet = false, relay = true } = {}) {
+  // relay — обычные сообщения мастера из панели теперь уходят этому клиенту.
+  // keepSetup — мастер ответил реплаем посреди настройки точки, которой занят прямо сейчас: обычные
+  // сообщения по-прежнему идут в настройку, а к клиенту он вернётся реплаем или «Писать сюда».
+  // Настройку, которую давно не трогали (бросил на полпути), реплай клиенту отодвигает.
+  async takeover(conv, adminId, { quiet = false, relay = true, keepSetup = false } = {}) {
     this.cancelScheduled(conv.id);
     if (conv.status === "waiting" && conv.handoff) conv.takenHandoff = conv.handoff;
     conv.status = "admin";
     conv.handledBy = adminId;
     conv.handoff = null;
+    // Взял диалог — его обычные сообщения теперь уходят клиенту, даже если он не закончил
+    // настройку точки (иначе ответ клиенту попадал в «Обновляю данные…»)
     const a = this.admin(adminId);
-    if (a && relay) a.relayTo = conv.id;
+    if (relay && a) {
+      if (keepSetup && this.setupFresh(a)) a.relayTo = conv.id;
+      else this.focusDialog(a, conv.id);
+    }
     this.save();
     if (!quiet) await this.sendTakeoverHint(conv, adminId);
   }
 
-  async returnToBot(conv, { answerPending = true } = {}) {
+  focusDialog(a, convId) {
+    if (!a) return;
+    a.relayTo = convId;
+    a.focus = "dialog";
+  }
+
+  // by — мастер, который нажал кнопку: ему скажут об этом там, где он нажал
+  async returnToBot(conv, { answerPending = true, by = null } = {}) {
     const hadAdminReply = conv.status === "admin" && conv.takenHandoff;
     conv.status = "bot";
     conv.handledBy = null;
     conv.handoff = null;
-    for (const a of Object.values(this.state.admins)) if (a.relayTo === conv.id) a.relayTo = null;
+    // Чьи обычные сообщения уходили этому клиенту: вернул диалог другой мастер — скажем им
+    const others = [];
+    for (const a of Object.values(this.state.admins)) {
+      if (a.relayTo !== conv.id) continue;
+      a.relayTo = null;
+      if (a.id !== by) others.push(a);
+    }
     // Для кнопки «Запомнить ответ»: вопрос, на который бот не смог, и ответ мастера
     if (hadAdminReply) {
       const since = conv.takenHandoff.at;
@@ -533,13 +662,37 @@ class App {
     }
     conv.takenHandoff = null;
     this.save();
-    const last = conv.messages[conv.messages.length - 1];
-    if (answerPending && last && last.role === "client" && !last.service) this.schedule(conv.id, 0);
+    // Последним писал клиент (возможно, бот успел ответить «уточню») — бот отвечает по существу
+    if (answerPending && this.pendingClientMessages(conv).length) this.schedule(conv.id, 0);
+    for (const a of others) {
+      await this.notifyAdmin(
+        a.id,
+        `🤖 Диалог с <b>${esc(conv.client.name)}</b> вернули боту — ваши сообщения этому клиенту больше не уходят.${
+          a.mode ? " Обычные сообщения теперь идут в настройку точки." : ""
+        }`,
+        [[{ text: "✋ Взять диалог", callback_data: `c:take:${conv.id}` }]],
+        conv.id
+      );
+    }
   }
 
   async relay(adminId, conv, msg, api) {
-    // Написал клиенту без «Перехватить» (например, реплаем) — бот в этом чате встаёт на паузу, говорим об этом
-    if (conv.status !== "admin" || conv.handledBy !== adminId) await this.takeover(conv, adminId);
+    const a = this.admin(adminId);
+    if (conv.status !== "admin" || conv.handledBy !== adminId) {
+      // Написал клиенту без «Перехватить» (например, реплаем) — бот в этом чате встаёт на паузу, говорим об этом
+      await this.takeover(conv, adminId, { keepSetup: true });
+    } else if (a?.mode && a.focus === "setup" && !this.setupFresh(a)) {
+      // Уже ведёт этот диалог, а настройку точки открыл и давно не трогал: раз ответил клиенту реплаем,
+      // дальше обычные сообщения снова идут клиенту — как после нового сообщения от него
+      this.focusDialog(a, conv.id);
+      this.save();
+      await this.notifyAdmin(
+        adminId,
+        `Настройка точки не закончена, но обычные сообщения теперь снова уходят клиенту <b>${esc(conv.client.name || "Клиент")}</b>. Чтобы вернуться к настройке, нажмите «Писать в настройку».`,
+        [[{ text: "✏️ Писать в настройку", callback_data: "s:focus" }]],
+        conv.id
+      );
+    }
     const text = msg.text || msg.caption || "";
     try {
       await this.markRead(conv);
@@ -595,7 +748,8 @@ class App {
       notes.push("ℹ️ Нет права «Отмечать сообщения прочитанными» — бот будет отвечать, но сообщения останутся непрочитанными до вашего ответа.");
     return say(
       `✅ <b>Бот подключён к вашему Telegram.</b>\nТеперь он отвечает клиентам в ваших личных чатах от вашего имени.\n\n` +
-        `• Если бот не уверен или случилась ошибка, он <b>не читает</b> сообщение и зовёт вас — непрочитанный чат будет у вас в списке, как обычно.\n` +
+        `• Если бот не знает ответа, он пишет клиенту, что уточнит и скоро ответит, и зовёт вас.\n` +
+        `• Если случилась ошибка, бот <b>не читает</b> сообщение и молча зовёт вас — непрочитанный чат будет у вас в списке, как обычно.\n` +
         `• Ответите клиенту сами — бот в этом чате замолчит, пока вы не вернёте его кнопкой.\n` +
         (notes.length ? `\n${notes.join("\n")}` : "")
     );
@@ -657,7 +811,8 @@ class App {
       const text = `Напоминаю: ${bookingLabel(b, today).replace(/–\d\d:\d\d$/, "")} у вас ${b.serviceName.toLowerCase()} у мастера ${b.staffName}. Ждём вас${
         shop.address ? ` по адресу ${[shop.city, shop.address].filter(Boolean).join(", ")}` : ""
       } 💈`;
-      await this.deliver(conv, text, "bot").catch((e) => this.log.warn("Напоминание:", e.message));
+      // Напоминание уходит, даже если диалог сейчас ведёт или ждёт мастер
+      await this.deliver(conv, text, "bot", { notice: true }).catch((e) => this.log.warn("Напоминание:", e.message));
     }
     // Проверка идёт раз в минуту — без изменений не переписываем файл состояния
     if (changed) this.save();
@@ -722,9 +877,11 @@ class App {
     const lines = [`🔴 <b>Нужен ответ мастера</b>`, this.clientLine(conv)];
     if (h.question) lines.push(`💬 «${esc(truncate(h.question, 700))}»`);
     lines.push(`⚠️ ${esc(h.reason)}`);
+    if (h.hold) lines.push(`🕐 Клиенту пишу: «${esc(truncate(h.hold, 300))}»`);
     if (h.draft) lines.push(`📝 Черновик бота: «${esc(truncate(h.draft, 700))}»`);
-    if (conv.kind === "business") lines.push("<i>Сообщение осталось непрочитанным — можно ответить прямо в своём Telegram.</i>");
-    else lines.push("<i>Ответьте реплаем на это сообщение — я передам клиенту.</i>");
+    if (conv.kind === "business") {
+      lines.push(h.hold ? "<i>Ответить можно прямо в своём Telegram.</i>" : "<i>Сообщение осталось непрочитанным — можно ответить прямо в своём Telegram.</i>");
+    } else lines.push("<i>Ответьте реплаем на это сообщение — я передам клиенту.</i>");
     const kb = [[{ text: "✋ Взять диалог", callback_data: `c:take:${conv.id}` }]];
     if (h.draft) kb[0].push({ text: "✅ Отправить черновик", callback_data: `c:send:${conv.id}` });
     kb.push([
@@ -752,12 +909,25 @@ class App {
     const targets = conv.handledBy ? [conv.handledBy] : Object.keys(this.state.admins).map(Number);
     for (const id of targets) {
       if (conv.kind === "business" && this.conn(conv)?.userId === id) continue; // он и так видит чат у себя
-      await this.notifyAdmin(
-        id,
-        `💬 <b>${esc(conv.client.name)}</b>: ${esc(truncate(text, 3000))}`,
-        [[{ text: "🤖 Вернуть боту", callback_data: `c:bot:${conv.id}` }]],
-        conv.id
-      );
+      const a = this.admin(id);
+      const lines = [`💬 <b>${esc(conv.client.name)}</b>: ${esc(truncate(text, 3000))}`];
+      const kb = [[{ text: "🤖 Вернуть боту", callback_data: `c:bot:${conv.id}` }]];
+      // Обычный ответ мастера сейчас ушёл бы не этому клиенту (в настройку точки или в другой чат) —
+      // говорим об этом сразу, иначе ответ снова пропадёт в «Обновляю настройки…»
+      if (this.dialogFocus(a) !== conv.id) {
+        if (a?.relayTo === conv.id && !this.setupFresh(a)) {
+          // Настройку давно не трогали, а клиент пишет сейчас — диалог важнее
+          this.focusDialog(a, conv.id);
+          lines.push("", "<i>Настройка точки не закончена, но обычные сообщения теперь снова уходят этому клиенту.</i>");
+          kb.push([{ text: "✏️ Писать в настройку", callback_data: "s:focus" }]);
+        } else {
+          const other = this.conv(this.dialogFocus(a));
+          const where = other ? `уходят клиенту <b>${esc(other.client.name || "Клиент")}</b>` : a?.mode ? "идут в настройку точки" : "";
+          lines.push("", `<i>${where ? `Обычные сообщения сейчас ${where}. ` : ""}Ответьте реплаем на это сообщение или нажмите «Писать сюда».</i>`);
+          kb.unshift([{ text: "✍️ Писать сюда", callback_data: `c:write:${conv.id}` }]);
+        }
+      }
+      await this.notifyAdmin(id, lines.join("\n"), kb, conv.id);
     }
     this.save();
   }
