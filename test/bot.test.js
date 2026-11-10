@@ -3903,3 +3903,44 @@ test("«Отправить черновик», пока бот занят дру
   assert.deepEqual(delivered(670), [STARTED]);
   assert.equal(conv.status, "bot");
 });
+
+// ИИ повторил начатый ответ в черновике и продолжил в той же строке, без пустой строки между ними
+
+test("своё «уточню» не ушло, а ИИ повторил начатое в черновике в той же строке — в черновике оно один раз, клиент получает его один раз", async () => {
+  const app = await makeApp();
+  an.respond = (body, n) => (n === 1 ? confident(STARTED) : callsMaster(`${STARTED} ${NEW_ONLY}`, OWN_HOLD));
+  slowTyping(app, 400);
+  await clientSays(app, 671, "Сколько стоит стрижка?");
+  await waitFor(() => typingCalls(671));
+  failSends(671, { times: 1, err: ERR500 });
+  await clientSays(app, 671, "А студентам скидка есть?");
+  await app.idle();
+
+  const conv = lastConv(app);
+  assert.equal(conv.status, "waiting");
+  assert.equal(conv.handoff.draft, `${STARTED}\n\n${NEW_ONLY}`);
+  slowTyping(app, 20);
+  await press(app, `c:send:${conv.id}`);
+  await app.idle();
+  assert.deepEqual(delivered(671), [STARTED, NEW_ONLY]);
+});
+
+test("начатый ответ ушёл, а бот не уверен в ответе на новое и повторил начатое в черновике в той же строке — в черновике мастеру только новое", async () => {
+  const app = await makeApp();
+  const GUESS = "Думаю, с собакой можно.";
+  an.respond = (body, n) => (n === 1 ? confident(STARTED) : final({ reply: `${STARTED} ${GUESS}`, confidence: 0.3, handoff: false, handoff_reason: "", hold: "" }));
+  slowTyping(app, 400);
+  await clientSays(app, 672, "Сколько стоит стрижка?");
+  await waitFor(() => typingCalls(672));
+  await clientSays(app, 672, "А с собакой можно?");
+  await app.idle();
+
+  const conv = lastConv(app);
+  assert.equal(conv.status, "waiting");
+  assert.deepEqual(delivered(672), [STARTED, HOLD]);
+  assert.equal(conv.handoff.draft, GUESS);
+  slowTyping(app, 20);
+  await press(app, `c:send:${conv.id}`);
+  await app.idle();
+  assert.deepEqual(delivered(672), [STARTED, HOLD, GUESS]);
+});
