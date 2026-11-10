@@ -814,20 +814,19 @@ const methods = {
           // Бот как раз занят этим диалогом. Вернуть диалог ему в эту секунду — стереть передачу мастеру, которую
           // он только что оформил (карточка ещё рассылается), а новый проход не начнётся: вопрос повис бы у бота
           if (this.busy.has(conv.id)) return answer(BOT_BUSY);
-          // В черновике то, что бот сам не смог отправить: сначала оно уходит клиенту (см. «Бот, попробуй ещё»)
-          if (conv.status === "waiting" && conv.handoff?.draftAfter != null) return this.onCallback({ ...cq, data: `c:send:${conv.id}` }, source);
           // Его обычные сообщения шли этому клиенту, а настройка точки не закрыта — дальше они пойдут в неё
           const toSetup = Boolean(a?.mode) && this.dialogFocus(a) === conv.id;
           // Возврат — сразу за проверкой, не дожидаясь ответа на нажатие (returnToBot меняет состояние до первого
-          // await): иначе в этот зазор успел бы начаться проход бота, и возврат стёр бы уже его передачу мастеру
-          await Promise.all([this.returnToBot(conv, { by: uid }), answer("Бот снова ведёт диалог")]);
+          // await): иначе в этот зазор успел бы начаться проход бота, и возврат стёр бы уже его передачу мастеру.
+          const back = this.returnToBot(conv, { by: uid, resume: true });
           const kb = conv.lastQA ? [[btn("📚 Запомнить мой ответ", `c:learn:${conv.id}`)]] : null;
-          return this.notifyAdmin(
-            uid,
-            `🤖 Бот снова ведёт диалог с <b>${esc(conv.client.name)}</b>.${toSetup ? " Обычные сообщения теперь идут в настройку точки." : ""}`,
-            kb,
-            conv.id
-          );
+          const note = `🤖 Бот снова ведёт диалог с <b>${esc(conv.client.name)}</b>.${toSetup ? " Обычные сообщения теперь идут в настройку точки." : ""}`;
+          await Promise.all([back, answer("Бот снова ведёт диалог"), this.notifyAdmin(uid, note, kb, conv.id)]);
+          // Последним писал клиент (возможно, бот успел ответить «уточню») — бот отвечает по существу. Уже после
+          // сообщения мастеру: если бот сразу позовёт мастера снова (клиент прислал фото), его карточка должна
+          // прийти после «Бот снова ведёт диалог», а не перед ним.
+          this.run(() => this.processConv(conv.id));
+          return;
         }
         case "send": {
           if (conv.status !== "waiting" || !conv.handoff?.draft) return answer("Черновика уже нет");
@@ -837,7 +836,11 @@ const methods = {
           // Карточка ещё рассылается мастерам: проход бота не закончен, и черновик пошёл бы вперемешку с ним
           if (this.busy.has(conv.id)) return answer(BOT_BUSY);
           const handoff = conv.handoff;
-          const seen = conv.msgCount; // черновик отвечает на то, что клиент написал до этой минуты
+          // Черновик отвечает на то, что клиент написал до этой минуты. А если в нём то, что бот раньше не смог
+          // отправить, — только на прежние сообщения (draftAfter): что клиент написал после них, остаётся без
+          // ответа, и бот вернётся к этому, когда черновик уйдёт.
+          const seen = conv.msgCount;
+          const after = handoff.draftAfter ?? seen;
           conv.status = "bot";
           conv.handoff = null;
           // Диалог занимаем сразу, а не когда уйдёт «Отправляю»: в этот зазор успел бы начаться проход бота
@@ -850,20 +853,19 @@ const methods = {
           this.run(async () => {
             let out;
             try {
-              // Черновик из того, что бот раньше не смог отправить, отвечает только на прежние сообщения
-              // (draftAfter): что клиент написал после них, остаётся без ответа, и бот вернётся к этому ниже
-              out = await this.deliver(conv, handoff.draft, "bot", { after: handoff.draftAfter ?? seen, by: uid });
+              out = await this.deliver(conv, handoff.draft, "bot", { after, by: uid });
             } finally {
               this.busy.delete(conv.id);
             }
             if (out.failed) {
               // Клиенту обещали ответ, а он не ушёл: диалог снова ждёт мастера, и то, что не ушло, остаётся
-              // черновиком. ИИ заново не зовём. Что клиент дописал, пока бот «печатал», показываем мастерам.
+              // черновиком (и помечено как недосланное: lost). ИИ заново не зовём. Что клиент дописал, пока бот
+              // «печатал», показываем мастерам.
               const back = conv.status === "bot"; // иначе диалог уже взял мастер
               const late = back ? conv.messages.filter((m) => m.role === "client" && !m.service && m.seq > seen).map((m) => m.text) : [];
               if (back) {
                 conv.status = "waiting";
-                conv.handoff = { ...handoff, draft: out.unsent };
+                conv.handoff = { ...handoff, draft: out.unsent, draftAfter: after, lost: { text: out.unsent, after } };
                 this.save();
               }
               const kb = [[btn("📜 Переписка", `c:open:${conv.id}`)]];
@@ -896,17 +898,15 @@ const methods = {
         case "retry":
           if (conv.status === "admin" && conv.handledBy !== uid) return answer("Этот диалог ведёт другой мастер", true);
           if (this.busy.has(conv.id)) return answer(BOT_BUSY); // как и «Вернуть боту»: бот ещё занят этим диалогом
-          // В черновике только то, что бот сам составил и не смог отправить (draftAfter). «Попробуй ещё» здесь —
-          // отправить это ещё раз: иначе недосланное пропало бы (заново ИИ его не напишет, если на вопрос уже
-          // ушла первая часть ответа). Остальное бот после отправки разберёт сам, как после «Отправить черновик».
-          if (conv.status === "waiting" && conv.handoff?.draftAfter != null) return this.onCallback({ ...cq, data: `c:send:${conv.id}` }, source);
-          // Возврат — сразу за проверкой, без ожидания между ними (см. «Вернуть боту»)
-          await Promise.all([this.returnToBot(conv, { answerPending: false, by: uid }), answer("Бот пробует ещё раз")]);
+          // Возврат — сразу за проверкой, без ожидания между ними (см. «Вернуть боту»). Что бот уже отправлял
+          // клиенту и не смог, возвращается ему вместе с диалогом (resume): клиент с тех пор молчал — уйдёт как
+          // есть, дописал — ИИ увидит это как неотправленный ответ и решит, что из него ещё верно.
+          await Promise.all([this.returnToBot(conv, { by: uid, resume: true }), answer("Бот пробует ещё раз")]);
           this.run(() => this.processConv(conv.id));
           return;
         case "close":
           conv.session = { ...(conv.session || {}), closed: true };
-          if (conv.status !== "bot") await this.returnToBot(conv, { answerPending: false, by: uid });
+          if (conv.status !== "bot") await this.returnToBot(conv, { by: uid });
           this.save();
           await answer("Диалог завершён");
           return this.showChat(uid, conv.id, cq);

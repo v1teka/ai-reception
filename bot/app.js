@@ -88,7 +88,8 @@ class App {
     for (const c of Object.values(this.state.conversations)) {
       // Завершённый диалог не поднимаем: следующий вопрос клиента начнёт новый разговор
       if (c.status !== "bot" || c.session?.closed || now - (c.lastClientAt || 0) > maxAgeMs) continue;
-      if (!this.pendingClientMessages(c).length) continue;
+      // Без ответа — сообщение клиента или то, что бот не дослал, а мастер вернул ему (см. returnToBot)
+      if (!c.unsent && !this.pendingClientMessages(c).length) continue;
       this.schedule(c.id);
       n++;
     }
@@ -364,18 +365,22 @@ class App {
     try {
       // Ответ, который бот не отправил, потому что клиент дописал. ИИ увидит его в следующем круге
       // и решит, как поступил бы человек: отправить и дописать про новое или ответить заново.
-      let draft = null;
+      // С него же начинается проход, если мастер вернул боту диалог с тем, что не ушло из-за сбоя (conv.unsent).
+      const resumed = this.conv(id);
+      let draft = resumed?.unsent || null;
+      if (resumed) resumed.unsent = null;
       // Следующий круг нового ответа не дал (сбой ИИ, лимит, вложение) — отправляем начатый как есть:
       // на то, что клиент спросил раньше, он отвечал верно. false — диалог уже взял мастер, дальше не идём.
       // Что не ушло из-за сбоя отправки, остаётся в lost; lostAfter — на какие сообщения клиента оно отвечало.
       let lost = "";
       let lostAfter = null;
+      let lostError = "";
       const flush = async (conv) => {
         if (draft) {
           const { text, after } = draft;
           draft = null;
           const out = await this.deliver(conv, text, "bot", { after });
-          if (out.failed) [lost, lostAfter] = [out.unsent, after];
+          if (out.failed) [lost, lostAfter, lostError] = [out.unsent, after, out.error];
         }
         return conv.status === "bot";
       };
@@ -383,14 +388,28 @@ class App {
       // не пишем (о сбое мастера уже знают), а то, что не ушло, мастер получит в начале черновика. Если кроме
       // этого в черновике ничего нет, он отвечает только на прежние сообщения клиента (draftAfter): после
       // «Отправить черновик» новое, ради которого звали мастера, остаётся без ответа и снова уйдёт мастеру.
+      // Само неотправленное карточка помнит отдельно (lost): «Бот, попробуй ещё» вернёт его боту (см. returnToBot).
       const toMaster = (conv, h) => {
         if (!lost) return this.handoff(conv, h);
         const full = [lost, h.draft].filter(Boolean).join("\n\n");
-        return this.handoff(conv, { ...h, draft: full, hold: "", draftAfter: h.draft ? null : lostAfter });
+        return this.handoff(conv, { ...h, draft: full, hold: "", draftAfter: h.draft ? null : lostAfter, lost: { text: lost, after: lostAfter } });
       };
+      const sendFailed = (conv, question) => toMaster(conv, { reason: `не удалось отправить ответ клиенту: ${lostError}`, question });
       for (let round = 0; round < 4; round++) {
         const conv = this.conv(id);
         if (!conv || conv.status !== "bot") return;
+        // Мастер вернул боту то, что не ушло из-за сбоя, а клиент с тех пор ничего не написал: ответ по-прежнему
+        // верен и уходит как есть, ИИ заново не зовём. (Обычный начатый ответ сюда не попадает: он появляется,
+        // только когда клиент дописал.) Написал — ниже ИИ увидит этот ответ как неотправленный и решит сам.
+        if (draft && !this.wroteSince(conv, draft.after)) {
+          const { question = "", upTo = 0 } = draft;
+          if (!(await flush(conv))) return;
+          if (!lost) continue; // дальше — то, что клиент прислал после (фото, голосовое), если есть
+          // Снова не ушло: диалог опять ждёт мастера. В вопросе — прежний вопрос и то, что клиент прислал после него
+          const more = this.pendingClientMessages(conv).filter((m) => m.seq > upTo).map((m) => m.text);
+          await sendFailed(conv, [question, ...more].filter(Boolean).join("\n"));
+          return;
+        }
         const pending = this.pendingClientMessages(conv);
         if (!pending.length) return;
 
@@ -459,11 +478,11 @@ class App {
           // Ответ не ушёл. ИИ впустую не крутим и клиенту больше не пишем: диалог переходит к мастеру, а то,
           // что не ушло, — в черновик, чтобы отправить ещё раз одним нажатием. Что клиент прислал уже после
           // этого ответа (фото, голосовое), после отправки черновика бот разберёт как обычно.
-          [lost, lostAfter] = [out.unsent, seen];
+          [lost, lostAfter, lostError] = [out.unsent, seen, out.error];
           // Вопрос в карточке — то, на что этот ответ отвечал, и то, что клиент дописал после. Если первая часть
           // ответа ушла, эти сообщения уже считаются отвеченными, и сама карточка их бы не показала.
           const asked = [...new Set([...pending, ...this.pendingClientMessages(conv)])].map((m) => m.text).join("\n");
-          if (conv.status === "bot") await toMaster(conv, { reason: `не удалось отправить ответ клиенту: ${out.error}`, question: asked });
+          if (conv.status === "bot") await sendFailed(conv, asked);
           return;
         }
         draft = out.unsent ? { text: out.unsent, after: seen } : null;
@@ -586,7 +605,8 @@ class App {
   // draftAfter — черновик отвечает только на сообщения клиента до этого номера (обычно — на все).
   // carried — начатый ответ { text, after }, который бот отдельно не отправлял: ИИ перенёс его в своё «уточню».
   // question — вопрос для карточки, если это не просто всё, что сейчас без ответа.
-  async handoff(conv, { reason, draft = "", confidence = null, error = false, hold = "", own = false, draftAfter = null, carried = null, question = null }) {
+  // lost — та часть черновика { text, after }, которую бот уже отправлял клиенту и не смог (см. returnToBot).
+  async handoff(conv, { reason, draft = "", confidence = null, error = false, hold = "", own = false, draftAfter = null, carried = null, question = null, lost = null }) {
     this.cancelScheduled(conv.id);
     // Одного «уточню» на вопрос хватает: после «Бот, попробуй ещё» второй раз не обещаем (см. mayHold)
     const holdText = this.mayHold(conv, hold, own) ? hold : "";
@@ -596,10 +616,12 @@ class App {
       reason,
       draft,
       draftAfter,
+      lost,
       confidence,
       error,
       hold: holdText,
       at: this.now(),
+      upTo: conv.msgCount, // вопрос ниже охватывает сообщения клиента до этого номера
       question:
         question ??
         this.pendingClientMessages(conv)
@@ -624,7 +646,7 @@ class App {
         const kept = carried && splitReply(carried.text).every((part) => said.includes(oneLine(part)));
         if (out.failed && !out.sent && kept && conv.handoff === h) {
           const rest = withoutStart(h.draft, carried.text);
-          Object.assign(h, { draft: [carried.text, rest].filter(Boolean).join("\n\n"), draftAfter: rest ? null : carried.after, hold: "" });
+          Object.assign(h, { draft: [carried.text, rest].filter(Boolean).join("\n\n"), draftAfter: rest ? null : carried.after, lost: { ...carried }, hold: "" });
           this.save();
           await this.notifyHandoff(conv).catch((e) => this.log.error("Карточка мастеру:", e));
         }
@@ -676,6 +698,7 @@ class App {
     conv.status = "admin";
     conv.handledBy = adminId;
     conv.handoff = null;
+    conv.unsent = null; // отвечает мастер — недосланное бот уже не досылает
     // Взял диалог — его обычные сообщения теперь уходят клиенту, даже если он не закончил
     // настройку точки (иначе ответ клиенту попадал в «Обновляю данные…»)
     const a = this.admin(adminId);
@@ -694,8 +717,23 @@ class App {
   }
 
   // by — мастер, который нажал кнопку: ему скажут об этом там, где он нажал
-  async returnToBot(conv, { answerPending = true, by = null } = {}) {
-    const hadAdminReply = conv.status === "admin" && conv.takenHandoff;
+  // resume — бот продолжает с того места, где позвал мастера («Бот, попробуй ещё», «Вернуть боту»). То, что он
+  // уже отправлял клиенту и не смог (handoff.lost), остаётся за ним: с этого начнётся следующий проход
+  // (processConv). Так же, если мастер взял диалог и вернул, ничего клиенту не написав. А если мастер ответил
+  // сам или диалог завершили, недосланное больше не нужно.
+  // Сам проход бота запускает тот, кто вернул диалог.
+  async returnToBot(conv, { by = null, resume = false } = {}) {
+    const taken = conv.status === "admin" ? conv.takenHandoff : null;
+    // Что мастер написал клиенту с тех пор, как бот его позвал
+    const answer = !taken
+      ? ""
+      : conv.messages
+          .filter((m) => m.role === "admin" && m.at >= taken.at)
+          .map((m) => m.text)
+          .join("\n");
+    const waited = !resume ? null : conv.status === "waiting" ? conv.handoff : answer ? null : taken;
+    // Диалог уже у бота (кнопку нажали дважды подряд, проход ещё не начался) — недосланное остаётся за ним
+    if (!resume || conv.status !== "bot") conv.unsent = waited?.lost ? { ...waited.lost, question: waited.question, upTo: waited.upTo } : null;
     conv.status = "bot";
     conv.handledBy = null;
     conv.handoff = null;
@@ -709,18 +747,9 @@ class App {
       if (a.id !== by) others.push(a);
     }
     // Для кнопки «Запомнить ответ»: вопрос, на который бот не смог, и ответ мастера
-    if (hadAdminReply) {
-      const since = conv.takenHandoff.at;
-      const answer = conv.messages
-        .filter((m) => m.role === "admin" && m.at >= since)
-        .map((m) => m.text)
-        .join("\n");
-      conv.lastQA = answer ? { q: conv.takenHandoff.question, a: answer } : null;
-    }
+    if (taken) conv.lastQA = answer ? { q: taken.question, a: answer } : null;
     conv.takenHandoff = null;
     this.save();
-    // Последним писал клиент (возможно, бот успел ответить «уточню») — бот отвечает по существу
-    if (answerPending && this.pendingClientMessages(conv).length) this.schedule(conv.id, 0);
     for (const a of others) {
       await this.notifyAdmin(
         a.id,
