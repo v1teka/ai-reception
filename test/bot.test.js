@@ -3459,3 +3459,55 @@ test("«Отправить черновик» под прежней карточ
   assert.deepEqual(delivered(645), [HOLD, DRAFT]);
   assert.equal(conv.status, "bot");
 });
+
+test("«уточню» с начатым ответом не ушло, а мастер нажал «Отправить черновик» под прежней карточкой, пока новая ещё идёт, — бот просит подождать, следующее нажатие отправляет оба ответа", async () => {
+  const app = await makeApp();
+  an.respond = (body, n) => (n === 1 ? confident(STARTED) : callsMaster(NEW_ONLY, OWN_HOLD));
+  slowTyping(app, 400);
+  await clientSays(app, 646, "Сколько стоит стрижка?");
+  await waitFor(() => typingCalls(646));
+  // Telegram один раз не принимает сообщение клиенту. Когда после этого владельцу уходит вторая карточка
+  // (уже с начатым ответом в черновике), он нажимает кнопку под первой
+  let failed = false;
+  let early = null;
+  tg.fail = (method, p) => {
+    if (method !== "sendMessage") return null;
+    if (String(p.chat_id) === "646" && !failed) {
+      failed = true;
+      tg.calls.at(-1).failed = true;
+      return ERR500;
+    }
+    if (failed && !early && String(p.chat_id) === String(OWNER) && /Нужен ответ мастера/.test(p.text)) {
+      early = press(app, `c:send:${lastConv(app).id}`);
+    }
+    return null;
+  };
+  await clientSays(app, 646, "А студентам скидка есть?");
+  await waitFor(() => early);
+  await early;
+  await app.idle();
+
+  const conv = lastConv(app);
+  assert.equal(tg.of("answerCallbackQuery").at(-1).params.text, "Секунду: бот дописывает клиенту — нажмите ещё раз");
+  assert.deepEqual(delivered(646), []);
+  assert.equal(conv.status, "waiting");
+  assert.equal(cards().length, 2);
+  assert.equal(conv.handoff.draft, `${STARTED}\n\n${NEW_ONLY}`);
+
+  slowTyping(app, 20);
+  await press(app, `c:send:${conv.id}`);
+  await app.idle();
+  assert.deepEqual(delivered(646), [STARTED, NEW_ONLY]);
+  assert.equal(conv.status, "bot");
+});
+
+test("начатый ответ стоит в черновике ИИ не в начале — бот его оттуда не вырезает: резать посреди текста опаснее повтора, который мастер видит в карточке", async () => {
+  const app = await makeApp();
+  const reply = `Про скидку: ${NEW_ONLY} А так — ${STARTED}`;
+  an.respond = (body, n) =>
+    n === 1 ? confident(STARTED) : final({ reply, confidence: 0.3, handoff: false, handoff_reason: "про скидки в данных ничего" });
+  const conv = await interruptedThenSendFails(app, 647, () => clientSays(app, 647, "А студентам скидка есть?"));
+  assert.equal(conv.status, "waiting");
+  assert.equal(sendFailures().length, 1);
+  assert.equal(conv.handoff.draft, `${STARTED}\n\n${reply}`);
+});
