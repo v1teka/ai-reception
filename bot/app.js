@@ -48,7 +48,12 @@ class App {
     this.setupBuffers = new Map(); // id мастера -> накопленный ввод для настройки
     this.tasks = new Set();
     this.keyIndex = new Map();
-    for (const c of Object.values(this.state.conversations)) this.keyIndex.set(c.key, c.id);
+    for (const c of Object.values(this.state.conversations)) {
+      this.keyIndex.set(c.key, c.id);
+      // Переписка из версии, где сообщения ещё не нумеровались: всё, что в ней есть, было «до» любого нового
+      // сообщения. Без номера «последнее, что видел бот» (seen, after, upTo) ни с чем не сравнить.
+      if (!c.msgCount) c.msgCount = c.messages?.length || 0;
+    }
   }
 
   get state() {

@@ -4581,8 +4581,13 @@ test("«Вернуть боту», а Telegram придержал сообщен
   const pressed = press(app, `c:bot:${conv.id}`).then(() => (done = true));
   try {
     await waitFor(() => typingCalls(703) > typed); // бот уже «печатает» клиенту…
-    assert.equal(notes(), 0); // …а сообщение мастеру ещё в пути,
-    assert.equal(done, false); // и нажатие не считается обработанным, пока оно не ушло
+    assert.equal(notes(), 0); // …а сообщение мастеру ещё в пути.
+    // Само нажатие при этом уже обработано: апдейты разбираются по одному, и то, что клиент напишет в эти
+    // секунды, не должно стоять в очереди за ним — иначе бот отвечал бы, не видя нового
+    await waitFor(() => done);
+    await waitFor(() => delivered(703).length === 2); // бот ответил клиенту,
+    assert.equal(notes(), 0);
+    await assert.rejects(app.idle(100), /idle timeout/); // а о сообщении мастеру помнит: перед остановкой его дождётся
   } finally {
     release();
   }
@@ -4622,7 +4627,8 @@ test("ответ не ушёл целиком, «Бот, попробуй ещё
 
 // Карточки, оформленные до этой версии: в файле состояния у них нет новых полей (draftAfter, lost, upTo).
 // Выкладка идёт на живого бота, и диалоги, которые в эту минуту ждут мастера, должны работать как раньше.
-const waitingFromOldVersion = async (chatId) => {
+// numbered: false — переписка ещё старше: из версии, где сообщения не нумеровались (нет ни счётчика, ни номеров)
+const waitingFromOldVersion = async (chatId, { numbered = true } = {}) => {
   const fs = require("node:fs");
   const before = await makeApp();
   an.respond = () => final({ reply: UNSURE, confidence: 0.3, handoff: false, handoff_reason: "про животных в данных ничего", hold: "" });
@@ -4636,6 +4642,10 @@ const waitingFromOldVersion = async (chatId) => {
   const { reason, draft, confidence, error, at, question } = state.conversations[id].handoff;
   assert.equal(draft, UNSURE);
   state.conversations[id].handoff = { reason, draft, confidence, error, at, question }; // только то, что писала прежняя версия
+  if (!numbered) {
+    delete state.conversations[id].msgCount;
+    for (const m of state.conversations[id].messages) delete m.seq;
+  }
   fs.writeFileSync(file, JSON.stringify(state));
   const app = await makeApp({ dataFile: file }); // перезапуск уже на новой версии
   const conv = app.conv(id);
@@ -4741,4 +4751,144 @@ test("недосланное из двух сообщений, «Бот, поп�
   assert.equal(an.requests.length, 2);
   assert.equal(conv.status, "bot");
   assert.equal(conv.unsent, null);
+});
+
+// ---------- недосланное: от чего считается «мастер написал после», взятый и завершённый диалог, что прерывает досылку ----------
+
+// «Мастер написал после недосланного» считается от самого недосланного (lost.after), а не от черновика карточки:
+// у карточки «недосланное + догадка ИИ про новое» черновик отвечает на всё (draftAfter пуст).
+test("мастер уже отвечал этому клиенту раньше, потом начатый ответ не ушёл, а в черновике ещё и догадка ИИ про новое; «Бот, попробуй ещё» — прежний ответ мастера не в счёт: ИИ видит недосланное, и оно уходит клиенту", async () => {
+  const app = await makeApp();
+  // Раньше: бот позвал мастера, тот ответил сам и вернул диалог боту
+  an.respond = callsMasterAgain;
+  await clientSays(app, 711, "Можно прийти с собакой?");
+  await app.idle();
+  const conv = lastConv(app);
+  await press(app, `c:take:${conv.id}`);
+  await adminSays(app, "С собакой можно.");
+  await press(app, `c:bot:${conv.id}`);
+  await app.idle();
+  assert.deepEqual(delivered(711), [HOLD, "С собакой можно."]);
+
+  // Теперь: клиент дописал, пока бот «печатал», начатый ответ не ушёл, а на новое у ИИ только догадка
+  const GUESS = "Думаю, студентам скидка 10%.";
+  an.respond = (body, n) =>
+    n === 2 ? confident(STARTED) : final({ reply: GUESS, confidence: 0.3, handoff: false, handoff_reason: "про скидки в данных ничего", hold: "" });
+  slowTyping(app, 400);
+  const typed = typingCalls(711);
+  await clientSays(app, 711, "Сколько стоит стрижка?");
+  await waitFor(() => typingCalls(711) > typed); // бот «печатает» ответ на первый вопрос
+  failSends(711, { times: 1, err: ERR500 });
+  await clientSays(app, 711, "А студентам скидка есть?");
+  await app.idle();
+  assert.equal(conv.status, "waiting");
+  assert.equal(conv.handoff.draft, `${STARTED}\n\n${GUESS}`);
+  assert.equal(conv.handoff.draftAfter, null); // черновик отвечает на всё, а недосланное — только на первый вопрос
+  assert.equal(conv.handoff.lost.text, STARTED);
+
+  slowTyping(app, 20);
+  await press(app, `c:retry:${conv.id}`);
+  await app.idle();
+  assert.deepEqual(messagesOf(an.requests.at(-1)).slice(-3), [
+    ["user", "Сколько стоит стрижка?"],
+    ["assistant", `[не отправлено] ${STARTED}`],
+    ["user", "А студентам скидка есть?"],
+  ]);
+  // ИИ опять не уверен в ответе на новое: начатое уходит как есть, новое ждёт мастера
+  assert.deepEqual(delivered(711), [HOLD, "С собакой можно.", STARTED, HOLD]);
+  assert.equal(conv.status, "waiting");
+  assert.equal(conv.handoff.draft, GUESS);
+});
+
+test("мастер взял диалог с недосланным ответом и завершил его, ничего не написав, — недосланное в новый разговор не переходит", async () => {
+  const app = await makeApp();
+  const conv = await secondPartFails(app, 712);
+  await press(app, `c:take:${conv.id}`);
+  await app.idle();
+  assert.equal(conv.status, "admin");
+  await press(app, `c:close:${conv.id}`);
+  await app.idle();
+  assert.equal(conv.status, "bot");
+  assert.equal(conv.unsent, null);
+
+  // Новый разговор клиент начинает с фото: ИИ его не разбирает, а недосланное из прошлого разговора бот не досылает
+  await clientSays(app, 712, undefined, PHOTO);
+  await app.idle();
+  assert.deepEqual(delivered(712), [STARTED, "Посмотрю и скоро отвечу"]);
+  assert.equal(conv.status, "waiting");
+  assert.equal(an.requests.length, 1);
+});
+
+// Досылку прерывает только то, что клиент написал ПОСЛЕ недосланного, а не после карточки, по которой звали мастера
+test("клиент дописал, пока диалог ждал мастера, мастер нажал «Отправить черновик», тот не ушёл, потом «Бот, попробуй ещё» — черновик одобрен уже после дописанного: бот его досылает, ИИ не зовёт", async () => {
+  const app = await makeApp();
+  const conv = await waitingWithDraft(app, 713);
+  await clientSays(app, 713, "Ау?");
+  await app.idle();
+  failSends(713, { times: 1, err: ERR500 });
+  await press(app, `c:send:${conv.id}`);
+  await app.idle();
+  assert.equal(conv.status, "waiting");
+  assert.deepEqual(conv.handoff.lost, { text: DRAFT, after: 3 });
+
+  await press(app, `c:retry:${conv.id}`);
+  await app.idle();
+  assert.deepEqual(delivered(713), [HOLD, DRAFT]);
+  assert.equal(conv.status, "bot");
+  assert.equal(an.requests.length, 1);
+});
+
+test("«Вернуть боту», а сообщение мастеру «Бот снова ведёт диалог» не ушло совсем — бот всё равно отвечает клиенту", async () => {
+  const app = await makeApp();
+  an.respond = () => callsMasterAgain();
+  await clientSays(app, 716, "Можно прийти с собакой?");
+  await app.idle();
+  const conv = lastConv(app);
+  await press(app, `c:take:${conv.id}`);
+  await app.idle();
+  an.respond = () => confident("Да, с собакой можно.");
+  tg.fail = (method, p) => (method === "sendMessage" && /Бот снова ведёт диалог/.test(p.text) ? ERR500 : null);
+  await press(app, `c:bot:${conv.id}`);
+  await app.idle();
+  assert.deepEqual(delivered(716), [HOLD, "Да, с собакой можно."]);
+  assert.equal(conv.status, "bot");
+});
+
+// Переписка, которую не трогали с версии, где сообщения ещё не нумеровались. При запуске она получает счётчик:
+// всё, что в ней есть, было «до» любого нового сообщения. Иначе «после какого сообщения» боту не с чем сравнить.
+test("переписка из версии без номеров сообщений: «Отправить черновик» не ушёл, мастер ответил сам и вернул диалог боту — бот не шлёт черновик поверх ответа мастера", async () => {
+  const { app, conv } = await waitingFromOldVersion(714, { numbered: false });
+  assert.equal(conv.msgCount, 2);
+  failSends(714, { times: 1, err: ERR500 });
+  await press(app, `c:send:${conv.id}`);
+  await app.idle();
+  assert.equal(conv.status, "waiting");
+  assert.deepEqual(conv.handoff.lost, { text: UNSURE, after: 2 });
+
+  await press(app, `c:take:${conv.id}`);
+  await adminSays(app, "С собакой нельзя, извините.");
+  await app.idle();
+  await press(app, `c:bot:${conv.id}`);
+  await app.idle();
+  assert.deepEqual(delivered(714), ["С собакой нельзя, извините."]);
+  assert.equal(an.requests.length, 0);
+  assert.equal(conv.status, "bot");
+  assert.equal(conv.unsent, null);
+});
+
+test("переписка из версии без номеров сообщений: «Отправить черновик», клиент дописал, пока черновик «печатался», — на дописанное бот отвечает отдельно", async () => {
+  const { app, conv } = await waitingFromOldVersion(715, { numbered: false });
+  an.respond = () => confident("Парковка во дворе.");
+  slowTyping(app, 400);
+  const typed = typingCalls(715);
+  await press(app, `c:send:${conv.id}`);
+  await waitFor(() => typingCalls(715) > typed);
+  await clientSays(app, 715, "А парковка есть?"); // пока черновик «печатается»
+  await app.idle();
+  assert.deepEqual(delivered(715), [UNSURE, "Парковка во дворе."]);
+  assert.deepEqual(
+    conv.messages.filter((m) => !m.service).map((m) => m.text),
+    ["Можно прийти с собакой?", HOLD, UNSURE, "А парковка есть?", "Парковка во дворе."]
+  );
+  assert.equal(conv.status, "bot");
 });
