@@ -27,6 +27,9 @@ const MEDIA = [
 ];
 const MEDIA_HOLD = Object.fromEntries(MEDIA.map(([, label, hold]) => [label, hold]));
 
+// Черновик без начатого ответа в начале: начатое клиент получает отдельным сообщением, второй раз не повторяем
+const withoutStart = (text, start) => (start && text.startsWith(start) ? text.slice(start.length).trim() : text);
+
 class App {
   constructor({ cfg, store, api, consoleApi, llm, log = console, now = () => Date.now(), sleep = realSleep, fetchImpl }) {
     this.cfg = cfg;
@@ -439,16 +442,15 @@ class App {
           if (!ownHold && !(await flush(conv))) return;
           // Черновик для мастера — только про новое: начатое уже ушло клиенту, а что из него не ушло из-за
           // сбоя, встанет в начало черновика само (toMaster) — второй раз не повторяем
-          let cardDraft = result.draft || "";
-          if (started && cardDraft.startsWith(started)) cardDraft = cardDraft.slice(started.length).trim();
           await toMaster(conv, {
             reason: result.reason,
-            draft: cardDraft,
+            draft: withoutStart(result.draft || "", started),
             confidence: result.confidence,
             // ИИ не знает ответа — клиенту «уточню и скоро отвечу» (своими словами или стандартной фразой).
             // Нет hold — ИИ отказался отвечать или ничего не написал: тогда молчим.
             hold: result.hold == null ? "" : ownHold ? result.hold : HOLD_TEXT,
             own: ownHold,
+            carried: ownHold ? draft : null, // не уйдёт «уточню» — начатое вернётся мастеру в черновик (см. handoff)
           });
           return;
         }
@@ -532,7 +534,7 @@ class App {
   // даже если диалог ведёт мастер. Ни то ни другое не ответ по существу, поэтому сообщения клиента
   // бот прочитанными не отмечает (это сделает тот, кто ответит).
   // stopIf — бросить устаревший ответ, если клиент дописал: вернёт неотправленный остаток в unsent.
-  // Сбой отправки — { failed: true, unsent: что не ушло, error }, мастерам уже написали (кроме мастера
+  // Сбой отправки — { failed: true, sent: сколько частей ушло, unsent: что не ушло, error }, мастерам уже написали (кроме мастера
   // by: он сам нажал кнопку, и ему ответит вызвавший). Мастер перехватил диалог, пока бот «печатал», —
   // { stopped: true, sent: сколько частей успело уйти }.
   async deliver(conv, text, role = "bot", { after = conv.msgCount, hold = false, notice = false, stopIf = null, by } = {}) {
@@ -567,7 +569,7 @@ class App {
           null,
           { except: by }
         );
-        return { failed: true, unsent, error: e.message };
+        return { failed: true, sent: i, unsent, error: e.message };
       }
     }
     this.save();
@@ -579,13 +581,14 @@ class App {
   // hold — что сразу написать клиенту («уточню и скоро отвечу»), чтобы он не ждал в тишине.
   // Пустая строка — бот молчит (например, при сбое ИИ). own — это слова самого ИИ, а не стандартная фраза.
   // draftAfter — черновик отвечает только на сообщения клиента до этого номера (обычно — на все).
-  async handoff(conv, { reason, draft = "", confidence = null, error = false, hold = "", own = false, draftAfter = null }) {
+  // carried — начатый ответ { text, after }, который бот отдельно не отправлял: ИИ перенёс его в своё «уточню».
+  async handoff(conv, { reason, draft = "", confidence = null, error = false, hold = "", own = false, draftAfter = null, carried = null }) {
     this.cancelScheduled(conv.id);
     // Одного «уточню» на вопрос хватает: после «Бот, попробуй ещё» второй раз не обещаем (см. mayHold)
     const holdText = this.mayHold(conv, hold, own) ? hold : "";
     if (holdText) this.holding.add(conv.id); // сразу: пока это «уточню» не ушло, второе не начинаем
     conv.status = "waiting";
-    conv.handoff = {
+    const h = (conv.handoff = {
       reason,
       draft,
       draftAfter,
@@ -596,7 +599,7 @@ class App {
       question: this.pendingClientMessages(conv)
         .map((m) => m.text)
         .join("\n"),
-    };
+    });
     this.save();
     this.log.info(`→ мастеру: разговор ${conv.id} (${reason})`);
     await this.notifyHandoff(conv).catch((e) => this.log.error("Карточка мастеру:", e));
@@ -604,7 +607,16 @@ class App {
     if (!holdText) return;
     this.run(async () => {
       try {
-        await this.deliver(conv, holdText, "bot", { hold: true });
+        const out = await this.deliver(conv, holdText, "bot", { hold: true });
+        // Своё «уточню» не ушло совсем, а начатый ответ был только в нём. Он не пропадает: встаёт в начало
+        // черновика (как в toMaster), и мастера получают карточку заново — без «Клиенту пишу», с кнопкой.
+        // Пока она не пришла, «Отправить черновик» под прежней карточкой просит подождать (holding).
+        if (out.failed && !out.sent && carried && conv.handoff === h) {
+          const rest = withoutStart(h.draft, carried.text);
+          Object.assign(h, { draft: [carried.text, rest].filter(Boolean).join("\n\n"), draftAfter: rest ? null : carried.after, hold: "" });
+          this.save();
+          await this.notifyHandoff(conv).catch((e) => this.log.error("Карточка мастеру:", e));
+        }
       } finally {
         this.holding.delete(conv.id);
       }

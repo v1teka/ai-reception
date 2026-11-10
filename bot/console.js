@@ -11,6 +11,8 @@ const DAY = 86400000;
 const SETUP_FRESH_MS = 15 * 60 * 1000;
 const btn = (text, data) => ({ text, callback_data: data });
 const BACK = [btn("◀️ Меню", "m:panel")];
+// Проход бота по диалогу ещё идёт (ИИ думает, бот «печатает» или рассылает карточку мастерам)
+const BOT_BUSY = "Секунду: бот ещё занят этим диалогом — нажмите ещё раз";
 
 // Длинный HTML режем по строкам, чтобы не упереться в лимит 4096 символов
 function chunks(text, max = 3900) {
@@ -809,6 +811,9 @@ const methods = {
           // заново, иначе «Вы ведёте диалог, бот молчит» было бы неправдой
           return this.takeover(conv, uid);
         case "bot": {
+          // Бот как раз занят этим диалогом. Вернуть диалог ему в эту секунду — стереть передачу мастеру, которую
+          // он только что оформил (карточка ещё рассылается), а новый проход не начнётся: вопрос повис бы у бота
+          if (this.busy.has(conv.id)) return answer(BOT_BUSY);
           // Его обычные сообщения шли этому клиенту, а настройка точки не закрыта — дальше они пойдут в неё
           const toSetup = Boolean(a?.mode) && this.dialogFocus(a) === conv.id;
           await answer("Бот снова ведёт диалог");
@@ -826,6 +831,8 @@ const methods = {
           // «Уточню» ещё «печатается», а в нём бывает часть ответа (начатое до того, как клиент дописал):
           // отправь мы черновик сейчас, оно бы не ушло совсем. Пусть сначала уйдёт.
           if (this.holding.has(conv.id)) return answer("Секунду: бот дописывает клиенту — нажмите ещё раз");
+          // Карточка ещё рассылается мастерам: проход бота не закончен, и черновик пошёл бы вперемешку с ним
+          if (this.busy.has(conv.id)) return answer(BOT_BUSY);
           const handoff = conv.handoff;
           const seen = conv.msgCount; // черновик отвечает на то, что клиент написал до этой минуты
           conv.status = "bot";
@@ -883,6 +890,7 @@ const methods = {
         }
         case "retry":
           if (conv.status === "admin" && conv.handledBy !== uid) return answer("Этот диалог ведёт другой мастер", true);
+          if (this.busy.has(conv.id)) return answer(BOT_BUSY); // как и «Вернуть боту»: бот ещё занят этим диалогом
           await answer("Бот пробует ещё раз");
           await this.returnToBot(conv, { answerPending: false, by: uid });
           this.run(() => this.processConv(conv.id));
