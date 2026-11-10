@@ -838,7 +838,9 @@ const methods = {
             this.busy.add(conv.id);
             let out;
             try {
-              out = await this.deliver(conv, handoff.draft, "bot", { after: seen, by: uid });
+              // Черновик из того, что бот раньше не смог отправить, отвечает только на прежние сообщения
+              // (draftAfter): что клиент написал после них, остаётся без ответа, и бот вернётся к этому ниже
+              out = await this.deliver(conv, handoff.draft, "bot", { after: handoff.draftAfter ?? seen, by: uid });
             } finally {
               this.busy.delete(conv.id);
             }

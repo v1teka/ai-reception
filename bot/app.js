@@ -364,20 +364,27 @@ class App {
       let draft = null;
       // Следующий круг нового ответа не дал (сбой ИИ, лимит, вложение) — отправляем начатый как есть:
       // на то, что клиент спросил раньше, он отвечал верно. false — диалог уже взял мастер, дальше не идём.
-      // Что не ушло из-за сбоя отправки, остаётся в lost.
+      // Что не ушло из-за сбоя отправки, остаётся в lost; lostAfter — на какие сообщения клиента оно отвечало.
       let lost = "";
+      let lostAfter = null;
       const flush = async (conv) => {
         if (draft) {
           const { text, after } = draft;
           draft = null;
           const out = await this.deliver(conv, text, "bot", { after });
-          if (out.failed) lost = out.unsent;
+          if (out.failed) [lost, lostAfter] = [out.unsent, after];
         }
         return conv.status === "bot";
       };
       // Сбой отправки передачу мастеру не отменяет: вопрос клиента не должен пропасть. Клиенту тогда больше
-      // не пишем (о сбое мастера уже знают), а то, что не ушло, мастер получит черновиком.
-      const toMaster = (conv, h) => this.handoff(conv, lost ? { ...h, draft: h.draft || lost, hold: "" } : h);
+      // не пишем (о сбое мастера уже знают), а то, что не ушло, мастер получит в начале черновика. Если кроме
+      // этого в черновике ничего нет, он отвечает только на прежние сообщения клиента (draftAfter): после
+      // «Отправить черновик» новое, ради которого звали мастера, остаётся без ответа и снова уйдёт мастеру.
+      const toMaster = (conv, h) => {
+        if (!lost) return this.handoff(conv, h);
+        const full = [lost, h.draft].filter(Boolean).join("\n\n");
+        return this.handoff(conv, { ...h, draft: full, hold: "", draftAfter: h.draft ? null : lostAfter });
+      };
       for (let round = 0; round < 4; round++) {
         const conv = this.conv(id);
         if (!conv || conv.status !== "bot") return;
@@ -430,9 +437,10 @@ class App {
           const ownHold = this.mayHold(conv, result.hold, true);
           const started = !ownHold && draft ? draft.text : "";
           if (!ownHold && !(await flush(conv))) return;
-          // Черновик для мастера — только про новое: то, что уже ушло клиенту, второй раз не отправляем
+          // Черновик для мастера — только про новое: начатое уже ушло клиенту, а что из него не ушло из-за
+          // сбоя, встанет в начало черновика само (toMaster) — второй раз не повторяем
           let cardDraft = result.draft || "";
-          if (started && !lost && cardDraft.startsWith(started)) cardDraft = cardDraft.slice(started.length).trim();
+          if (started && cardDraft.startsWith(started)) cardDraft = cardDraft.slice(started.length).trim();
           await toMaster(conv, {
             reason: result.reason,
             draft: cardDraft,
@@ -448,7 +456,7 @@ class App {
         if (out.failed) {
           // Мастерам о сбое уже написали, ИИ впустую не крутим. Но фото или голосовое, которые клиент прислал
           // тем временем, разберёт только мастер: следующий круг передаст их ему вместе с тем, что не ушло.
-          lost = out.unsent;
+          [lost, lostAfter] = [out.unsent, seen];
           draft = null;
           if (!this.pendingClientMessages(conv).some((m) => m.needsHuman)) return;
           continue;
@@ -569,7 +577,8 @@ class App {
 
   // hold — что сразу написать клиенту («уточню и скоро отвечу»), чтобы он не ждал в тишине.
   // Пустая строка — бот молчит (например, при сбое ИИ). own — это слова самого ИИ, а не стандартная фраза.
-  async handoff(conv, { reason, draft = "", confidence = null, error = false, hold = "", own = false }) {
+  // draftAfter — черновик отвечает только на сообщения клиента до этого номера (обычно — на все).
+  async handoff(conv, { reason, draft = "", confidence = null, error = false, hold = "", own = false, draftAfter = null }) {
     this.cancelScheduled(conv.id);
     // Одного «уточню» на вопрос хватает: после «Бот, попробуй ещё» второй раз не обещаем (см. mayHold)
     const holdText = this.mayHold(conv, hold, own) ? hold : "";
@@ -578,6 +587,7 @@ class App {
     conv.handoff = {
       reason,
       draft,
+      draftAfter,
       confidence,
       error,
       hold: holdText,

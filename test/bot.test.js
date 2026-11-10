@@ -2750,10 +2750,22 @@ test("ИИ сам позвал мастера на новый вопрос, а �
   assert.doesNotMatch(card.params.text, /Клиенту пишу/);
   assert.ok(buttons(card).includes(`c:send:${conv.id}`));
 
+  // Черновик отвечает только на первый вопрос. Мастер его отправил — цена дошла, а вопрос про собаку
+  // отвеченным не считается: бот снова передаёт его мастеру, теперь уже с «уточню»
   await press(app, `c:send:${conv.id}`);
   await app.idle();
-  assert.deepEqual(delivered(617), [STARTED]);
-  assert.equal(conv.status, "bot");
+  assert.deepEqual(delivered(617), [STARTED, "Уточню и скоро вам отвечу"]);
+  assert.equal(an.requests.length, 3);
+  assert.equal(conv.status, "waiting");
+  assert.equal(cards().length, 2);
+  assert.equal(conv.handoff.question, "А с собакой можно?");
+  assert.equal(conv.handoff.draft, "");
+  assert.deepEqual(conv.messages.map((m) => [m.role, Boolean(m.hold)]), [
+    ["client", false],
+    ["bot", false],
+    ["client", false],
+    ["bot", true],
+  ]);
 });
 
 const PHOTO = { photo: [{ file_id: "p1", width: 10, height: 10 }] };
@@ -2795,9 +2807,15 @@ test("клиент прислал фото, пока бот «печатал», 
   assert.equal(conv.handoff.draft, STARTED);
   assert.equal(conv.handoff.hold, "");
 
+  // Мастер отправил ответ, который не ушёл, — а фото по-прежнему ждёт его: кроме мастера, его никто не разберёт
   await press(app, `c:send:${conv.id}`);
   await app.idle();
-  assert.deepEqual(delivered(622), [STARTED]);
+  assert.deepEqual(delivered(622), [STARTED, "Посмотрю и скоро отвечу"]);
+  assert.equal(an.requests.length, 1);
+  assert.equal(conv.status, "waiting");
+  assert.equal(cards().length, 2);
+  assert.equal(conv.handoff.question, "[фото]");
+  assert.match(cards().at(-1).params.text, /клиент прислал фото/);
 });
 
 test("ответ не ушёл, а больше клиент ничего не присылал — мастерам сказано о сбое, диалог остаётся у бота, ИИ заново не зовём", async () => {
@@ -2996,4 +3014,87 @@ test("бот переписал ответ, клиент прислал фото
   assert.equal(conv.status, "waiting");
   assert.equal(conv.handoff.draft, REDONE);
   assert.match(cards().at(-1).params.text, /клиент прислал фото/);
+});
+
+// ---------- начатый ответ не ушёл, а в черновике ИИ — только про новое ----------
+const NEW_ONLY = "Студентам, кажется, скидка 10%.";
+// То, что не ушло, стоит в начале черновика: одно нажатие — и клиент получает оба ответа, каждый по разу
+const lostIsInDraft = async (app, conv, chatId) => {
+  assert.equal(an.requests.length, 2);
+  assert.deepEqual(delivered(chatId), []);
+  assert.equal(sendFailures().length, 1);
+  assert.equal(conv.status, "waiting");
+  assert.equal(cards().length, 1);
+  assert.equal(conv.handoff.draft, `${STARTED}\n\n${NEW_ONLY}`);
+  assert.equal(conv.handoff.draftAfter, null);
+  assert.match(cards()[0].params.text, /Черновик бота: «Мужская стрижка — 1 800 ₽\.\n\nСтудентам, кажется, скидка 10%\.»/);
+
+  await press(app, `c:send:${conv.id}`);
+  await app.idle();
+  assert.deepEqual(delivered(chatId), [STARTED, NEW_ONLY]);
+  // Мастер отправил ответ и на новый вопрос, так что бот к нему не возвращается
+  assert.equal(conv.status, "bot");
+  assert.equal(an.requests.length, 2);
+  assert.equal(cards().length, 1);
+};
+
+test("ИИ позвал мастера и дал черновик только про новое, а начатый ответ не ушёл — в черновике оба ответа, начатое первым", async () => {
+  const app = await makeApp();
+  an.respond = (body, n) =>
+    n === 1 ? confident(STARTED) : final({ reply: NEW_ONLY, confidence: 0.9, handoff: true, handoff_reason: "скидки решает мастер", hold: "" });
+  const conv = await interruptedThenSendFails(app, 630, () => clientSays(app, 630, "А студентам скидка есть?"));
+  await lostIsInDraft(app, conv, 630);
+});
+
+test("бот не уверен и ответил только на новое, а начатый ответ не ушёл — в черновике оба ответа, начатое первым", async () => {
+  const app = await makeApp();
+  an.respond = (body, n) =>
+    n === 1 ? confident(STARTED) : final({ reply: NEW_ONLY, confidence: 0.3, handoff: false, handoff_reason: "про скидки в данных ничего" });
+  const conv = await interruptedThenSendFails(app, 631, () => clientSays(app, 631, "А студентам скидка есть?"));
+  await lostIsInDraft(app, conv, 631);
+});
+
+test("начатый ответ из двух сообщений, второе не ушло — в черновике только оно и ответ на новое, первое клиент дважды не получит", async () => {
+  const app = await makeApp();
+  slowTyping(app, 400);
+  const WHERE = "Мы на ул. Примерной, 1.";
+  an.respond = (body, n) =>
+    n === 1
+      ? confident(`${STARTED}\n\n${WHERE}`)
+      : final({ reply: `${STARTED}\n\n${WHERE}\n\n${NEW_ONLY}`, confidence: 0.3, handoff: false, handoff_reason: "про скидки в данных ничего" });
+  await clientSays(app, 632, "Сколько стоит стрижка и где вы?");
+  await waitFor(() => typingCalls(632));
+  failSends(632, { times: 1, when: (p) => /Примерной/.test(p.text), err: { code: 500, description: "Internal Server Error" } });
+  await clientSays(app, 632, "А студентам скидка есть?");
+  await app.idle();
+
+  const conv = lastConv(app);
+  assert.equal(an.requests.length, 2);
+  assert.deepEqual(delivered(632), [STARTED]);
+  assert.equal(sendFailures().length, 1);
+  assert.equal(conv.status, "waiting");
+  assert.equal(conv.handoff.draft, `${WHERE}\n\n${NEW_ONLY}`);
+
+  await press(app, `c:send:${conv.id}`);
+  await app.idle();
+  assert.deepEqual(delivered(632), [STARTED, WHERE, NEW_ONLY]);
+  assert.equal(conv.status, "bot");
+});
+
+test("elsewhereNote: подсказка нужна, только если обычное сообщение мастера ушло бы не этому клиенту", async () => {
+  const app = await makeApp();
+  an.respond = () => needsMasterWith("");
+  await clientSays(app, 633, "Можно прийти с собакой?");
+  await app.idle();
+  const first = lastConv(app);
+  await clientSays(app, 634, "А кошку можно?", { from: user(634, "Пётр", "petr") });
+  await app.idle();
+  const second = lastConv(app);
+  assert.notEqual(first.id, second.id);
+
+  const a = app.admin(OWNER);
+  assert.equal(app.elsewhereNote(a, first), ""); // никого не ведёт и настройку не открывал
+  await press(app, `c:take:${first.id}`);
+  assert.equal(app.elsewhereNote(a, first), ""); // пишет как раз этому клиенту
+  assert.equal(app.elsewhereNote(a, second), "Обычные сообщения сейчас уходят клиенту <b>Иван</b>.");
 });
