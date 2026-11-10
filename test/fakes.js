@@ -28,6 +28,7 @@ class FakeTelegram {
     this.msgId = 1000;
     this.files = {};
     this.updates = {};
+    this.fail = null; // (method, params) → { code, description } — ответить ошибкой Telegram
   }
 
   async start() {
@@ -50,6 +51,11 @@ class FakeTelegram {
     const token = m[1];
     const method = m[2];
     this.calls.push({ token, method, params, at: Date.now() });
+    const err = this.fail?.(method, params);
+    if (err) {
+      res.setHeader("content-type", "application/json");
+      return res.end(JSON.stringify({ ok: false, error_code: err.code || 400, description: err.description || "Bad Request" }));
+    }
     let result = true;
     switch (method) {
       case "getMe":
@@ -87,6 +93,7 @@ class FakeTelegram {
 
   reset() {
     this.calls = [];
+    this.fail = null;
   }
 
   close() {
@@ -110,7 +117,7 @@ class FakeAnthropic {
 
   async handle(req, res) {
     const body = JSON.parse(await readBody(req));
-    this.requests.push({ body, headers: req.headers, url: req.url });
+    this.requests.push({ body, headers: req.headers, url: req.url, at: Date.now() });
     let out = this.respond(body, this.requests.length);
     if (out && out.delayMs) {
       await new Promise((r) => setTimeout(r, out.delayMs));

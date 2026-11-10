@@ -1,6 +1,6 @@
 // Панель мастера в Telegram: переписки, перехват и возврат боту, записи,
 // настройки точки (Яндекс.Карты, правки словами, знания), приглашение мастера.
-const { esc, truncate, randomCode, userName } = require("./util");
+const { esc, truncate, oneLine, randomCode, userName, atMost } = require("./util");
 const { nowParts, fmtTime, fmtDate, fmtDateRelative, addDays, ago } = require("./time");
 const { upcomingBookings, bookingLabel, cancelBooking, freeStarts } = require("./schedule");
 const { renderSummary, renderFull, demoShop, emptyShop, serviceLine } = require("./shop");
@@ -8,8 +8,13 @@ const { importFromYandex, updateFromMessage, noteFromImages } = require("./setup
 const { extractYandexUrl } = require("./yandex");
 
 const DAY = 86400000;
+const SETUP_FRESH_MS = 15 * 60 * 1000;
 const btn = (text, data) => ({ text, callback_data: data });
 const BACK = [btn("◀️ Меню", "m:panel")];
+// Проход бота по диалогу ещё идёт (ИИ думает, бот «печатает» или рассылает карточку мастерам)
+const BOT_BUSY = "Секунду: бот ещё занят этим диалогом — нажмите ещё раз";
+// Сколько бот после «Вернуть боту» ждёт, пока мастеру уйдёт «Бот снова ведёт диалог», прежде чем отвечать клиенту
+const NOTE_WAIT_MS = 1500;
 
 // Длинный HTML режем по строкам, чтобы не упереться в лимит 4096 символов
 function chunks(text, max = 3900) {
@@ -46,6 +51,9 @@ const methods = {
           link_preview_options: { is_disabled: true },
           ...markup,
         });
+        // На месте карточки переписки теперь другой экран: реплай на него — уже не ответ тому клиенту
+        // (showChat после show() привязывает своё сообщение заново)
+        delete this.state.consoleRefs[`${adminId}:${cq.message.message_id}`];
         return;
       } catch (e) {
         if (/not modified/i.test(e.message)) return;
@@ -98,7 +106,17 @@ const methods = {
         bookings.filter((b) => b.date === addDays(today, 1)).length
       }</b>`,
     ];
-    if (hint) lines.push("", "<i>Чтобы проверить бота как клиент, просто напишите ему обычное сообщение.</i>");
+    // Мастер ведёт диалог — говорим, куда уходят его обычные сообщения: «просто напишите» отправило бы
+    // проверочный вопрос его клиенту, а /panel посреди настройки закрывает её
+    const note = this.relayNote(a);
+    if (hint) {
+      lines.push(
+        "",
+        note
+          ? `<i>${note} Чтобы проверить бота как клиент, сначала верните этот диалог боту.</i>`
+          : "<i>Чтобы проверить бота как клиент, просто напишите ему обычное сообщение.</i>"
+      );
+    } else if (note) lines.push("", `<i>${note}</i>`);
     const kb = [];
     if (l.waiting.length) kb.push([btn(`🔴 Ждут ответа (${l.waiting.length})`, "m:list:waiting")]);
     if (l.mine.length) kb.push([btn(`✋ Ведёте вы (${l.mine.length})`, "m:list:mine")]);
@@ -122,7 +140,8 @@ const methods = {
     const lines = [`<b>${titles[kind]}</b>`, ""];
     if (!items.length) lines.push("Пока пусто 👌");
     for (const c of items) {
-      const last = [...c.messages].reverse().find((m) => !m.service);
+      // «Уточню и скоро отвечу» и напоминания не показываем: важнее, что спросил клиент
+      const last = [...c.messages].reverse().find((m) => !m.service && !m.hold && !m.notice);
       lines.push(
         `${this.convIcon(c)} <b>${esc(c.client.name || "Клиент")}</b> — «${esc(truncate(last?.text || "", 70))}» · ${ago(c.updatedAt, this.now())}`
       );
@@ -171,7 +190,7 @@ const methods = {
     }
     if (c.status === "admin") {
       const row = [];
-      if (this.admin(adminId)?.relayTo !== c.id && !own) row.push(btn("✍️ Писать сюда", `c:write:${c.id}`));
+      if (this.dialogFocus(this.admin(adminId)) !== c.id && !own) row.push(btn("✍️ Писать сюда", `c:write:${c.id}`));
       row.push(btn("🤖 Вернуть боту", `c:bot:${c.id}`));
       kb.push(row);
     }
@@ -184,20 +203,29 @@ const methods = {
 
   async sendTakeoverHint(conv, adminId) {
     const last = this.pendingClientMessages(conv).map((m) => m.text).join("\n");
-    const lines = [
-      `✋ Вы ведёте диалог с <b>${esc(conv.client.name)}</b>. Бот в этом чате молчит.`,
-      conv.kind === "business"
-        ? "Пишите сюда — я отправлю клиенту от вашего имени. Можно отвечать и прямо из своего Telegram."
-        : "Пишите сюда — я передам клиенту.",
-      "Чтобы ответить в другой чат, ответьте реплаем на его сообщение.",
-    ];
+    const a = this.admin(adminId);
+    const here = this.dialogFocus(a) === conv.id;
+    const lines = [`✋ Вы ведёте диалог с <b>${esc(conv.client.name)}</b>. Бот в этом чате молчит.`];
+    const kb = [[btn("🤖 Вернуть боту", `c:bot:${conv.id}`), btn("✅ Завершить", `c:close:${conv.id}`)]];
+    if (here) {
+      lines.push(
+        conv.kind === "business"
+          ? "Пишите сюда — я отправлю клиенту от вашего имени. Можно отвечать и прямо из своего Telegram."
+          : "Пишите сюда — я передам клиенту.",
+        "Чтобы ответить в другой чат, ответьте реплаем на его сообщение."
+      );
+      // Настройка точки осталась открытой: поправка к ней теперь ушла бы клиенту
+      if (a?.mode) {
+        lines.push("Настройка точки не закончена: чтобы вернуться к ней, нажмите «Писать в настройку».");
+        kb.push([btn("✏️ Писать в настройку", "s:focus")]);
+      }
+    } else {
+      // Ответил реплаем посреди настройки точки — настройка остаётся главной
+      lines.push("Вы сейчас в настройке точки, поэтому обычные сообщения идут туда. Клиенту отвечайте реплаем на его сообщение или нажмите «Писать сюда».");
+      kb.unshift([btn("✍️ Писать сюда", `c:write:${conv.id}`)]);
+    }
     if (last) lines.push("", `Последнее от клиента: «${esc(truncate(last, 800))}»`);
-    await this.notifyAdmin(
-      adminId,
-      lines.join("\n"),
-      [[btn("🤖 Вернуть боту", `c:bot:${conv.id}`), btn("✅ Завершить", `c:close:${conv.id}`)]],
-      conv.id
-    );
+    await this.notifyAdmin(adminId, lines.join("\n"), kb, conv.id);
   },
 
   // ---------- записи и свободное время ----------
@@ -267,8 +295,11 @@ const methods = {
       "",
       renderSummary(s),
       "",
-      "Загрузите свою точку с Яндекс.Карт или просто напишите, что изменить: услуги, цены, график, любые факты для ответов клиентам.",
+      "Загрузите свою точку с Яндекс.Карт или нажмите «Изменить словами или фото» и напишите, что изменить: услуги, цены, график, любые факты для ответов клиентам.",
     ];
+    // Без кнопки сообщение в настройку не попадёт, а если мастер ведёт диалог — уйдёт клиенту
+    const note = this.relayNote(this.admin(adminId));
+    if (note) lines.push("", `<i>${note}</i>`);
     const kb = [
       [btn("🗺 Загрузить с Яндекс.Карт", "s:yandex")],
       [btn("✏️ Изменить словами или фото", "s:edit")],
@@ -290,7 +321,10 @@ const methods = {
       kb.push(k.slice(i, i + 4).map((n) => btn(`🗑 ${n.id}`, `s:kdel:${n.id}`)));
     }
     kb.push([btn("◀️ Настройки", "m:settings")]);
-    return this.show(adminId, chunks(lines.join("\n"))[0], kb, cq);
+    // Заметка сохранена — настройка закрыта: если мастер ведёт диалог, следующая «заметка» ушла бы клиенту
+    const note = this.relayNote(this.admin(adminId));
+    const tail = note ? `\n\n<i>${note} Чтобы добавить заметку, нажмите «Добавить заметку».</i>` : "";
+    return this.show(adminId, chunks(lines.join("\n"), 3900 - tail.length)[0] + tail, kb, cq);
   },
 
   async showPreview(adminId, shop, changes) {
@@ -299,10 +333,49 @@ const methods = {
       lines.push("", "<b>На что обратить внимание</b>");
       for (const c of changes.slice(0, 15)) lines.push(`• ${esc(c)}`);
     }
-    lines.push("", "Можно написать поправку словами — я обновлю черновик.");
-    return this.sendLong(adminId, lines.join("\n"), [
-      [btn("✅ Сохранить", "s:save"), btn("❌ Отменить", "s:cancel")],
-    ]);
+    const kb = [[btn("✅ Сохранить", "s:save"), btn("❌ Отменить", "s:cancel")]];
+    this.touchSetup(this.admin(adminId));
+    const hint = this.setupFocusHint(this.admin(adminId));
+    if (hint) {
+      lines.push("", hint.note);
+      kb.unshift(hint.row);
+    } else lines.push("", "Можно написать поправку словами — я обновлю черновик.");
+    return this.sendLong(adminId, lines.join("\n"), kb);
+  },
+
+  // Куда сейчас уходят обычные сообщения мастера: id диалога с клиентом или null (в настройку точки,
+  // если она открыта). Решает то, что мастер выбрал последним: «Изменить словами», «Загрузить
+  // с Яндекс.Карт», «Добавить заметку» — настройка; «Взять диалог», «Писать сюда» — клиент.
+  dialogFocus(a) {
+    if (!a?.relayTo || (a.mode && a.focus === "setup")) return null;
+    return a.relayTo;
+  },
+
+  // Настройка точки ждёт данных, а обычные сообщения мастера сейчас уходят клиенту
+  // (он взял диалог, пока ИИ разбирал данные) — подсказка и кнопка, чтобы писать в настройку
+  setupFocusHint(a) {
+    const note = a?.mode ? this.relayNote(a) : "";
+    if (!note) return null;
+    return {
+      note: `${note} Чтобы писать в настройку точки, нажмите «Писать в настройку».`,
+      row: [btn("✏️ Писать в настройку", "s:focus")],
+    };
+  },
+
+  // Мастер ведёт диалог, и его обычные сообщения уходят клиенту — фраза об этом (иначе пусто)
+  relayNote(a) {
+    const c = this.conv(this.dialogFocus(a));
+    return c ? `Сейчас ваши сообщения уходят клиенту <b>${esc(c.client.name || "Клиент")}</b>.` : "";
+  },
+
+  // Обычное сообщение мастера ушло бы сейчас не этому клиенту (в настройку точки или другому клиенту) —
+  // фраза об этом для уведомления, иначе пусто
+  elsewhereNote(a, conv) {
+    const focus = this.dialogFocus(a);
+    if (focus === conv.id) return "";
+    const other = this.conv(focus);
+    if (other) return `Обычные сообщения сейчас уходят клиенту <b>${esc(other.client.name || "Клиент")}</b>.`;
+    return a?.mode ? "Обычные сообщения сейчас идут в настройку точки." : "";
   },
 
   // Подробности сбоя импорта (HTML) — для владельца бота
@@ -321,8 +394,26 @@ const methods = {
     this.save();
   },
 
+  // Мастер сам открыл настройку (кнопкой или по приглашению): его обычные сообщения теперь идут
+  // в неё, даже если он ведёт диалог. К клиенту вернут «Писать сюда» или реплай на его сообщение.
+  startSetup(a, mode, extra = {}) {
+    this.setMode(a, mode, { ...extra, focus: "setup", setupAt: this.now() });
+  },
+
+  // Мастер занят настройкой прямо сейчас: открыл её, писал в неё или получил от неё ответ не раньше
+  // чем SETUP_FRESH_MS назад. Брошенная на полпути настройка уступает диалогу с клиентом.
+  setupFresh(a) {
+    return Boolean(a?.mode && a.focus === "setup" && this.now() - (a.setupAt || 0) < SETUP_FRESH_MS);
+  },
+  touchSetup(a) {
+    if (!a?.mode) return;
+    a.setupAt = this.now();
+    this.save();
+  },
+
   // Ввод для настройки копим ~1,5 с: альбом из нескольких фото приходит отдельными сообщениями
   bufferSetupInput(a, msg, api) {
+    this.touchSetup(a);
     const buf = this.setupBuffers.get(a.id) || { items: [], timer: null };
     const photo = msg.photo ? msg.photo[msg.photo.length - 1].file_id : null;
     const imageDoc = msg.document && /^image\//.test(msg.document.mime_type || "") ? msg.document.file_id : null;
@@ -340,7 +431,17 @@ const methods = {
     const a = this.admin(adminId);
     if (!a || !a.mode) return;
     const text = items.map((i) => i.text).filter(Boolean).join("\n").trim();
-    const say = (t, kb) => this.sendHtml(adminId, t, kb ? { reply_markup: { inline_keyboard: kb } } : {});
+    const say = (t, kb) => {
+      // Пока ИИ разбирал данные, мастер мог вернуться к клиенту: тогда без подсказки
+      // ответ на «пришлите текстом» ушёл бы клиенту
+      const hint = this.setupFocusHint(this.admin(adminId));
+      if (hint) {
+        t += `\n\n${hint.note}`;
+        kb = [hint.row, ...(kb || [])];
+      }
+      this.touchSetup(a); // настройка ответила мастеру — он ею занят
+      return this.sendHtml(adminId, t, kb ? { reply_markup: { inline_keyboard: kb } } : {});
+    };
     const imageList = [];
     for (const it of items.filter((i) => i.file)) {
       try {
@@ -400,11 +501,13 @@ const methods = {
     }
 
     const base = a.pending || (a.freshBase && this.shop.demo ? emptyShop(this.shop) : this.shop);
-    await say("⏳ Обновляю данные…");
+    await say("⏳ Обновляю настройки точки…");
     const r = await updateFromMessage({ llm: this.llm, cfg: this.cfg, shop: base, text, imageList });
     if (!r.ok) return say(`😕 Не получилось: ${esc(r.reason)}. Попробуйте ещё раз или сформулируйте иначе.`);
     if (!r.changes.length && !a.pending && JSON.stringify(r.shop.services) === JSON.stringify(base.services)) {
-      return say("Кажется, менять нечего. Напишите, что именно поправить, или нажмите «Отменить».", [[btn("❌ Отменить", "s:cancel")]]);
+      return say("Кажется, в настройках точки менять нечего. Напишите, что именно поправить, или нажмите «Отменить», чтобы выйти из настройки.", [
+        [btn("❌ Отменить", "s:cancel")],
+      ]);
     }
     this.setMode(a, "review", { pending: r.shop, freshBase: false });
     return this.showPreview(adminId, r.shop, r.changes);
@@ -416,21 +519,26 @@ const methods = {
     const cancelKb = [[btn("❌ Отменить", "s:cancel")]];
     switch (act) {
       case "yandex":
-        this.setMode(a, "await_yandex", { freshBase: true, pending: null });
+        this.startSetup(a, "await_yandex", { freshBase: true, pending: null });
         return say(
           "🗺 Пришлите ссылку на вашу точку в Яндекс.Картах.\nВ приложении: карточка организации → «Поделиться» → «Скопировать ссылку».\n\nЯ заберу название, адрес, график, телефон и прайс. Если Яндекс не пустит, подойдут скриншоты или текст.",
           [[btn("✏️ Опишу словами", "s:edit"), btn("❌ Отменить", "s:cancel")]]
         );
       case "edit":
-        this.setMode(a, "await_edit", { pending: a.pending || null });
+        this.startSetup(a, "await_edit", { pending: a.pending || null });
         return say(
           "✏️ Напишите, что изменить или что боту нужно знать. Можно прислать фото прайса или скриншоты.\n\nНапример:\n• «по воскресеньям выходной»\n• «стрижка теперь 2000 ₽, длится час»\n• «добавь услугу укладка 700 ₽ на 30 минут»\n• «есть парковка во дворе, оплата только картой»",
           cancelKb
         );
+      case "focus":
+        if (!a.mode) return say("Настройка точки уже закрыта.");
+        a.focus = "setup";
+        this.touchSetup(a);
+        return say("✏️ Теперь ваши сообщения идут в настройку точки. Клиенту можно ответить реплаем на его сообщение или кнопкой «✍️ Писать сюда» в переписке.");
       case "kn":
         return this.showKnowledge(adminId, cq);
       case "kadd":
-        this.setMode(a, "await_note");
+        this.startSetup(a, "await_note");
         return say("📚 Пришлите заметку текстом или фото — сохраню как есть. Например: «Работаем без перерыва», «Скидка 10% студентам по студенческому».", cancelKb);
       case "kdel": {
         const before = this.shop.knowledge.length;
@@ -489,9 +597,11 @@ const methods = {
         await say("✅ Сохранено. Бот уже отвечает клиентам по новым данным.");
         return this.showSettings(adminId);
       }
-      case "cancel":
+      case "cancel": {
         this.setMode(a, null, { pending: null, freshBase: false });
-        return say("Отменено, данные точки не менялись.", [[btn("⚙️ Настройки", "m:settings"), btn("💈 Меню", "m:panel")]]);
+        const note = this.relayNote(a);
+        return say(`Отменено, данные точки не менялись.${note ? ` ${note}` : ""}`, [[btn("⚙️ Настройки", "m:settings"), btn("💈 Меню", "m:panel")]]);
+      }
     }
   },
 
@@ -515,7 +625,7 @@ const methods = {
     }
     inv.usedBy = user.id;
     const a = this.ensureAdmin(user, inv.role || "admin");
-    this.setMode(a, "await_yandex", { freshBase: true, pending: null });
+    this.startSetup(a, "await_yandex", { freshBase: true, pending: null });
     await this.setCommands().catch(() => {});
     for (const o of Object.values(this.state.admins).filter((x) => x.role === "owner")) {
       await this.notifyAdmin(o.id, `👤 ${esc(userName(user))} принял приглашение и стал мастером.`);
@@ -548,9 +658,12 @@ const methods = {
       "❓ <b>Как это работает</b>",
       "",
       "• Бот отвечает клиентам: услуги, цены, адрес, свободное время, запись. Каждая услуга занимает 1–4 слота подряд.",
-      "• Если бот не уверен в ответе, клиент прислал фото/голосовое или ИИ не ответил вовремя — бот молчит и присылает вам карточку с черновиком. Можно отправить черновик, ответить самому или дать боту попробовать ещё раз.",
+      "• Если бот не знает ответа или клиент прислал фото/голосовое — бот пишет клиенту, что уточнит и скоро ответит, а вам присылает карточку с черновиком. Можно отправить черновик, ответить самому или дать боту попробовать ещё раз.",
+      "• Если ИИ не ответил вовремя или случился сбой — бот молчит и тоже присылает вам карточку.",
       "• «Перехватить» — бот замолкает в этом чате, а ваши сообщения отсюда уходят клиенту. «Вернуть боту» — бот снова отвечает сам.",
-      "• Ответить реплаем на уведомление — сообщение уйдёт этому клиенту.",
+      "• Ответить реплаем на уведомление — сообщение уйдёт этому клиенту, даже если вы сейчас настраиваете точку.",
+      "• Обычные сообщения идут туда, что вы выбрали последним: в диалог, который взяли, или в настройку точки, которую открыли. Переключают кнопки «Писать сюда» и «Писать в настройку». Настройку, которую вы 15 минут не трогали, бот считает отложенной: когда клиент напишет снова или вы ответите ему реплаем, обычные сообщения опять пойдут клиенту.",
+      "• «Завершить диалог» — разговор окончен: переписка возвращается боту и пропадает из «Незавершённых», а следующее сообщение клиента начнёт новый разговор. В «Текущих» она остаётся: там все переписки за сутки.",
       "• Новые записи и отмены приходят сюда же.",
       "",
       "<b>Telegram Business (рекомендуется)</b>",
@@ -590,10 +703,12 @@ const methods = {
         case "help":
           await this.show(uid, this.helpText(), [BACK]);
           return true;
-        case "cancel":
+        case "cancel": {
           this.setMode(a, null, { pending: null, freshBase: false });
-          await api.sendMessage(uid, "Отменено.");
+          const note = this.relayNote(a);
+          await this.sendHtml(uid, note ? `Отменено. ${note}` : "Отменено.");
           return true;
+        }
         default:
           if (!fallthrough) {
             await this.showPanel(uid);
@@ -603,13 +718,17 @@ const methods = {
       }
     }
 
-    if (a.mode) {
+    // Реплай на сообщение о переписке — всегда ответ этому клиенту, даже посреди настройки точки
+    const ref = msg.reply_to_message && this.state.consoleRefs[`${uid}:${msg.reply_to_message.message_id}`];
+    const replyTo = ref ? this.conv(ref) : null;
+    // Обычное сообщение — туда, что мастер выбрал последним (см. dialogFocus)
+    const dialog = replyTo ? null : this.conv(this.dialogFocus(a));
+    if (a.mode && !replyTo && !dialog) {
       this.bufferSetupInput(a, msg, api);
       return true;
     }
 
-    const ref = msg.reply_to_message && this.state.consoleRefs[`${uid}:${msg.reply_to_message.message_id}`];
-    const target = (ref && this.conv(ref)) || (a.relayTo && this.conv(a.relayTo));
+    const target = replyTo || dialog;
     if (target) {
       if (this.isOwnChat(target, uid)) {
         await api.sendMessage(uid, "Это ваш собственный чат с ботом — в него нельзя писать как мастер. Проверьте с другого аккаунта или подключите отдельного бота для панели.");
@@ -688,31 +807,95 @@ const methods = {
           await answer("Диалог ваш");
           return this.takeover(conv, uid);
         case "write":
-          a.relayTo = conv.id;
-          this.save();
+          if (this.isOwnChat(conv, uid)) return answer("Это ваш собственный чат с ботом — писать в него как мастер нельзя", true);
           await answer("Пишите — сообщения уйдут этому клиенту");
-          return this.sendTakeoverHint(conv, uid);
+          // Кнопка могла остаться в старом сообщении, а диалог с тех пор вернули боту: берём его
+          // заново, иначе «Вы ведёте диалог, бот молчит» было бы неправдой
+          return this.takeover(conv, uid);
         case "bot": {
-          await answer("Бот снова ведёт диалог");
-          await this.returnToBot(conv);
+          // Бот как раз занят этим диалогом. Вернуть диалог ему в эту секунду — стереть передачу мастеру, которую
+          // он только что оформил (карточка ещё рассылается), а новый проход не начнётся: вопрос повис бы у бота
+          if (this.busy.has(conv.id)) return answer(BOT_BUSY);
+          // Его обычные сообщения шли этому клиенту, а настройка точки не закрыта — дальше они пойдут в неё
+          const toSetup = Boolean(a?.mode) && this.dialogFocus(a) === conv.id;
+          // Возврат — сразу за проверкой, не дожидаясь ответа на нажатие (returnToBot меняет состояние до первого
+          // await): иначе в этот зазор успел бы начаться проход бота, и возврат стёр бы уже его передачу мастеру.
+          const back = this.returnToBot(conv, { by: uid, resume: true });
           const kb = conv.lastQA ? [[btn("📚 Запомнить мой ответ", `c:learn:${conv.id}`)]] : null;
-          return this.notifyAdmin(uid, `🤖 Бот снова ведёт диалог с <b>${esc(conv.client.name)}</b>.`, kb, conv.id);
+          const note = `🤖 Бот снова ведёт диалог с <b>${esc(conv.client.name)}</b>.${toSetup ? " Обычные сообщения теперь идут в настройку точки." : ""}`;
+          const told = Promise.all([back, answer("Бот снова ведёт диалог"), this.notifyAdmin(uid, note, kb, conv.id)]);
+          // Последним писал клиент (возможно, бот успел ответить «уточню») — бот отвечает по существу. Уже после
+          // сообщения мастеру: если бот сразу позовёт мастера снова (клиент прислал фото), его карточка должна
+          // прийти после «Бот снова ведёт диалог», а не перед ним. Но клиент из-за этого долго не ждёт: придержал
+          // Telegram сообщение мастеру (лимит сообщений в один чат, медленная сеть) — бот начинает, не дождавшись.
+          await atMost(told, NOTE_WAIT_MS);
+          this.run(() => this.processConv(conv.id));
+          // Сообщение мастеру дойдёт в фоне. Ждать его здесь нельзя: апдейты разбираются по одному, и то, что
+          // клиент напишет в эти секунды, стояло бы в очереди за нажатием — бот отвечал бы, не видя нового.
+          this.run(() => told);
+          return;
         }
         case "send": {
           if (conv.status !== "waiting" || !conv.handoff?.draft) return answer("Черновика уже нет");
-          const draft = conv.handoff.draft;
+          // «Уточню» ещё «печатается», а в нём бывает часть ответа (начатое до того, как клиент дописал):
+          // отправь мы черновик сейчас, оно бы не ушло совсем. Пусть сначала уйдёт.
+          if (this.holding.has(conv.id)) return answer("Секунду: бот дописывает клиенту — нажмите ещё раз");
+          // Карточка ещё рассылается мастерам: проход бота не закончен, и черновик пошёл бы вперемешку с ним
+          if (this.busy.has(conv.id)) return answer(BOT_BUSY);
+          const handoff = conv.handoff;
+          // Черновик отвечает на то, что клиент написал до этой минуты. А если в нём то, что бот раньше не смог
+          // отправить, — только на прежние сообщения (draftAfter): что клиент написал после них, остаётся без
+          // ответа, и бот вернётся к этому, когда черновик уйдёт.
+          const seen = conv.msgCount;
+          const after = handoff.draftAfter ?? seen;
           conv.status = "bot";
           conv.handoff = null;
+          // Диалог занимаем сразу, а не когда уйдёт «Отправляю»: в этот зазор успел бы начаться проход бота
+          // (клиент дописал), и ИИ ответил бы на тот же вопрос, что и черновик
+          this.busy.add(conv.id);
           this.save();
           await answer("Отправляю");
           // «Печатает…» идёт в фоне, чтобы не задерживать остальные апдейты. Пока черновик уходит,
           // ИИ в этом чате не отвечает, а потом отвечает на то, что клиент успел дописать.
           this.run(async () => {
-            this.busy.add(conv.id);
+            let out;
             try {
-              await this.deliver(conv, draft, "bot");
+              out = await this.deliver(conv, handoff.draft, "bot", { after, by: uid });
             } finally {
               this.busy.delete(conv.id);
+            }
+            if (out.failed) {
+              // Клиенту обещали ответ, а он не ушёл: диалог снова ждёт мастера, и то, что не ушло, остаётся
+              // черновиком (и помечено как недосланное: lost). ИИ заново не зовём. Что клиент дописал, пока бот
+              // «печатал», показываем мастерам.
+              const back = conv.status === "bot"; // иначе диалог уже взял мастер
+              const late = back ? conv.messages.filter((m) => m.role === "client" && !m.service && m.seq > seen).map((m) => m.text) : [];
+              if (back) {
+                conv.status = "waiting";
+                conv.handoff = { ...handoff, draft: out.unsent, draftAfter: after, lost: { text: out.unsent, after } };
+                this.save();
+              }
+              const kb = [[btn("📜 Переписка", `c:open:${conv.id}`)]];
+              if (back) kb[0].unshift(btn("✅ Отправить ещё раз", `c:send:${conv.id}`));
+              await this.notifyAdmin(
+                uid,
+                `⚠️ Не удалось отправить черновик клиенту <b>${esc(conv.client.name)}</b>: ${esc(out.error)}` +
+                  (back ? "\nДиалог снова ждёт ответа, а то, что не ушло, осталось в черновике." : ""),
+                kb,
+                conv.id
+              );
+              if (late.length) await this.notifyMoreFromClient(conv, late.join("\n"));
+              return;
+            }
+            if (out.stopped) {
+              const what = out.sent ? "ушёл не полностью" : "не отправлен";
+              await this.notifyAdmin(
+                uid,
+                `Черновик для <b>${esc(conv.client.name)}</b> ${what}: диалог взял мастер, пока бот «печатал».`,
+                [[btn("📜 Переписка", `c:open:${conv.id}`)]],
+                conv.id
+              );
+              return;
             }
             if (!this.timers.has(conv.id)) this.schedule(conv.id, 0);
             await this.notifyAdmin(uid, `✅ Черновик отправлен <b>${esc(conv.client.name)}</b>.`, null, conv.id);
@@ -721,20 +904,25 @@ const methods = {
         }
         case "retry":
           if (conv.status === "admin" && conv.handledBy !== uid) return answer("Этот диалог ведёт другой мастер", true);
-          await answer("Бот пробует ещё раз");
-          await this.returnToBot(conv, { answerPending: false });
+          if (this.busy.has(conv.id)) return answer(BOT_BUSY); // как и «Вернуть боту»: бот ещё занят этим диалогом
+          // Возврат — сразу за проверкой, без ожидания между ними (см. «Вернуть боту»). Что бот уже отправлял
+          // клиенту и не смог, возвращается ему вместе с диалогом (resume): клиент с тех пор молчал — уйдёт как
+          // есть, дописал — ИИ увидит это как неотправленный ответ и решит, что из него ещё верно.
+          await Promise.all([this.returnToBot(conv, { by: uid, resume: true }), answer("Бот пробует ещё раз")]);
           this.run(() => this.processConv(conv.id));
           return;
         case "close":
           conv.session = { ...(conv.session || {}), closed: true };
-          if (conv.status !== "bot") await this.returnToBot(conv, { answerPending: false });
+          conv.unsent = null; // недосланное в завершённый диалог бот не досылает, даже если уже взялся («Бот, попробуй ещё»)
+          if (conv.status !== "bot") await this.returnToBot(conv, { by: uid });
           this.save();
           await answer("Диалог завершён");
           return this.showChat(uid, conv.id, cq);
         case "learn": {
           if (!conv.lastQA) return answer("Нечего запоминать");
           const { q, a: ans } = conv.lastQA;
-          this.shop.knowledge.push({ id: null, text: `Клиент спросил: «${truncate(q, 500)}». Ответ мастера: «${truncate(ans, 1000)}».` });
+          // Вопрос писал клиент, а знания точки увидит ИИ в разговоре с каждым: только в кавычках и одной строкой
+          this.shop.knowledge.push({ id: null, text: `Клиент спросил: «${truncate(oneLine(q), 500)}». Ответ мастера: «${truncate(oneLine(ans), 1000)}».` });
           this.state.shop = require("./shop").normalizeShop(this.shop);
           conv.lastQA = null;
           this.save();
