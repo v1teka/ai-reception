@@ -4,7 +4,7 @@ const { generateReply, unansweredTail, replyIndex } = require("./assistant");
 const { typingDuration, splitReply } = require("./typing");
 const { upcomingBookings, bookingLabel, minutesUntilStart } = require("./schedule");
 const { nowParts } = require("./time");
-const { esc, truncate, sleep: realSleep, randomCode, userName } = require("./util");
+const { esc, truncate, oneLine, sleep: realSleep, randomCode, userName } = require("./util");
 
 const HOUR = 3600000;
 
@@ -460,7 +460,10 @@ class App {
           // что не ушло, — в черновик, чтобы отправить ещё раз одним нажатием. Что клиент прислал уже после
           // этого ответа (фото, голосовое), после отправки черновика бот разберёт как обычно.
           [lost, lostAfter] = [out.unsent, seen];
-          if (conv.status === "bot") await toMaster(conv, { reason: `не удалось отправить ответ клиенту: ${out.error}` });
+          // Вопрос в карточке — то, на что этот ответ отвечал, и то, что клиент дописал после. Если первая часть
+          // ответа ушла, эти сообщения уже считаются отвеченными, и сама карточка их бы не показала.
+          const asked = [...new Set([...pending, ...this.pendingClientMessages(conv)])].map((m) => m.text).join("\n");
+          if (conv.status === "bot") await toMaster(conv, { reason: `не удалось отправить ответ клиенту: ${out.error}`, question: asked });
           return;
         }
         draft = out.unsent ? { text: out.unsent, after: seen } : null;
@@ -582,7 +585,8 @@ class App {
   // Пустая строка — бот молчит (например, при сбое ИИ). own — это слова самого ИИ, а не стандартная фраза.
   // draftAfter — черновик отвечает только на сообщения клиента до этого номера (обычно — на все).
   // carried — начатый ответ { text, after }, который бот отдельно не отправлял: ИИ перенёс его в своё «уточню».
-  async handoff(conv, { reason, draft = "", confidence = null, error = false, hold = "", own = false, draftAfter = null, carried = null }) {
+  // question — вопрос для карточки, если это не просто всё, что сейчас без ответа.
+  async handoff(conv, { reason, draft = "", confidence = null, error = false, hold = "", own = false, draftAfter = null, carried = null, question = null }) {
     this.cancelScheduled(conv.id);
     // Одного «уточню» на вопрос хватает: после «Бот, попробуй ещё» второй раз не обещаем (см. mayHold)
     const holdText = this.mayHold(conv, hold, own) ? hold : "";
@@ -596,9 +600,11 @@ class App {
       error,
       hold: holdText,
       at: this.now(),
-      question: this.pendingClientMessages(conv)
-        .map((m) => m.text)
-        .join("\n"),
+      question:
+        question ??
+        this.pendingClientMessages(conv)
+          .map((m) => m.text)
+          .join("\n"),
     });
     this.save();
     this.log.info(`→ мастеру: разговор ${conv.id} (${reason})`);
@@ -611,7 +617,12 @@ class App {
         // Своё «уточню» не ушло совсем, а начатый ответ был только в нём. Он не пропадает: встаёт в начало
         // черновика (как в toMaster), и мастера получают карточку заново — без «Клиенту пишу», с кнопкой.
         // Пока она не пришла, «Отправить черновик» под прежней карточкой просит подождать (holding).
-        if (out.failed && !out.sent && carried && conv.handoff === h) {
+        // Только если ИИ перенёс начатое в «уточню» как есть, каждое сообщение слово в слово: переписал — значит,
+        // оно устарело (клиент уточнил вопрос), и одним нажатием такое отправлять нельзя. Что не ушло, мастера
+        // видят в предупреждении.
+        const said = oneLine(holdText);
+        const kept = carried && splitReply(carried.text).every((part) => said.includes(oneLine(part)));
+        if (out.failed && !out.sent && kept && conv.handoff === h) {
           const rest = withoutStart(h.draft, carried.text);
           Object.assign(h, { draft: [carried.text, rest].filter(Boolean).join("\n\n"), draftAfter: rest ? null : carried.after, hold: "" });
           this.save();
@@ -928,7 +939,9 @@ class App {
     if (h.draft) lines.push(`📝 Черновик бота: «${esc(truncate(h.draft, 700))}»`);
     // Последняя строка — как ответить. Если обычное сообщение мастера сейчас ушло бы не этому клиенту
     // (в незакрытую настройку точки или другому клиенту), говорим об этом прямо в карточке
-    const own = h.hold ? "Ответить можно прямо в своём Telegram." : "Сообщение осталось непрочитанным — можно ответить прямо в своём Telegram.";
+    // «Осталось непрочитанным» — только если это правда: «уточню» не уходило и бот ничего не отмечал прочитанным
+    // (перед ответом, который потом не ушёл, он это уже сделал)
+    const own = h.hold || !conv.unread?.length ? "Ответить можно прямо в своём Telegram." : "Сообщение осталось непрочитанным — можно ответить прямо в своём Telegram.";
     const how = (a) => {
       const where = this.elsewhereNote(a, conv);
       if (conv.kind === "business") return `<i>${where ? `${where} ` : ""}${own}</i>`;

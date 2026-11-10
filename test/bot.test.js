@@ -3399,6 +3399,13 @@ const pressWhileCardGoes = (app, data) => {
     await app.idle();
   };
 };
+// Что бот ответил на каждое нажатие, по порядку нажатий. Telegram показывает мастеру первый ответ на нажатие,
+// поэтому на каждое он должен быть один
+const answersByPress = () => {
+  const by = new Map();
+  for (const c of tg.of("answerCallbackQuery")) by.set(c.params.callback_query_id, [...(by.get(c.params.callback_query_id) || []), c.params.text]);
+  return [...by.values()];
+};
 
 test("мастер второй раз нажал «Бот, попробуй ещё», пока бот рассылал новую карточку, — передача мастеру не стирается, вопрос не повисает у бота", async () => {
   const app = await makeApp({ env: { ADMIN_IDS: "200" } });
@@ -3414,7 +3421,7 @@ test("мастер второй раз нажал «Бот, попробуй е�
   await press(app, `c:retry:${conv.id}`);
   await secondPress();
 
-  assert.equal(tg.of("answerCallbackQuery").at(-1).params.text, BOT_BUSY);
+  assert.deepEqual(answersByPress().slice(-2), [["Бот пробует ещё раз"], [BOT_BUSY]]);
   assert.equal(conv.status, "waiting");
   assert.equal(conv.handoff.question, "Можно прийти с собакой?");
   assert.equal(an.requests.length, 2);
@@ -3434,7 +3441,7 @@ test("мастер второй раз нажал «Вернуть боту», �
   await press(app, `c:bot:${conv.id}`);
   await secondPress();
 
-  assert.equal(tg.of("answerCallbackQuery").at(-1).params.text, BOT_BUSY);
+  assert.deepEqual(answersByPress().slice(-2), [["Бот снова ведёт диалог"], [BOT_BUSY]]);
   assert.equal(conv.status, "waiting");
   assert.equal(conv.handoff.question, "Можно прийти с собакой?");
   assert.equal(an.requests.length, 2);
@@ -3448,7 +3455,7 @@ test("«Отправить черновик» под прежней карточ
   await press(app, `c:retry:${conv.id}`);
   await earlyPress();
 
-  assert.equal(tg.of("answerCallbackQuery").at(-1).params.text, BOT_BUSY);
+  assert.deepEqual(answersByPress().slice(-2), [["Бот пробует ещё раз"], [BOT_BUSY]]);
   assert.equal(conv.status, "waiting");
   assert.equal(conv.handoff.draft, DRAFT);
   assert.deepEqual(delivered(645), [HOLD]);
@@ -3510,4 +3517,389 @@ test("начатый ответ стоит в черновике ИИ не в н
   assert.equal(conv.status, "waiting");
   assert.equal(sendFailures().length, 1);
   assert.equal(conv.handoff.draft, `${STARTED}\n\n${reply}`);
+});
+
+// Между проверкой «бот занят» и самим действием кнопки ждать нельзя. Здесь Telegram отвечает на нажатие дольше
+// обычного, и за это время успевает сработать таймер клиента: раньше в этот зазор начинался проход бота.
+const slowToasts = (app, ms = 150) => {
+  const call = app.api.call.bind(app.api);
+  app.api.call = async (method, ...rest) => {
+    if (method === "answerCallbackQuery") await new Promise((r) => setTimeout(r, ms));
+    return call(method, ...rest);
+  };
+};
+// Бот ведёт диалог, клиент только что прислал фото: таймер «клиент допишет» уже стоит, проход ещё не начался
+const photoJustCame = async (app, chatId) => {
+  an.respond = () => confident("Здравствуйте!");
+  await clientSays(app, chatId, "Здравствуйте");
+  await app.idle();
+  slowToasts(app);
+  await clientSays(app, chatId, undefined, PHOTO);
+  return lastConv(app);
+};
+// Проход бота передал фото мастеру, и эту передачу нажатие не стёрло: одна карточка, клиент получил «посмотрю»
+const photoReachedMaster = (conv, chatId) => {
+  assert.equal(conv.status, "waiting");
+  assert.equal(conv.handoff.question, "[фото]");
+  assert.equal(cards().length, 1);
+  assert.deepEqual(delivered(chatId), ["Здравствуйте!", "Посмотрю и скоро отвечу"]);
+  assert.equal(an.requests.length, 1);
+};
+
+test("«Бот, попробуй ещё» за мгновение до прохода бота (клиент только что прислал фото) — передача мастеру, которую оформил этот проход, не стирается", async () => {
+  const app = await makeApp();
+  const conv = await photoJustCame(app, 648);
+  await press(app, `c:retry:${conv.id}`); // кнопка под старой карточкой
+  await app.idle();
+  photoReachedMaster(conv, 648);
+});
+
+test("«Вернуть боту» за мгновение до прохода бота (клиент только что прислал фото) — передача мастеру, которую оформил этот проход, не стирается", async () => {
+  const app = await makeApp();
+  const conv = await photoJustCame(app, 649);
+  await press(app, `c:bot:${conv.id}`);
+  await app.idle();
+  photoReachedMaster(conv, 649);
+});
+
+test("клиент дописал, пока Telegram отвечал на нажатие «Отправить черновик», — ИИ не отвечает на тот же вопрос, что и черновик", async () => {
+  const app = await makeApp();
+  const conv = await waitingWithDraft(app, 650);
+  slowToasts(app);
+  an.respond = () => confident("Парковка есть, во дворе.");
+  const pressed = press(app, `c:send:${conv.id}`);
+  await waitFor(() => conv.status === "bot");
+  await clientSays(app, 650, "И ещё: парковка есть?");
+  await pressed;
+  await app.idle();
+
+  assert.deepEqual(delivered(650), [HOLD, DRAFT, "Парковка есть, во дворе."]);
+  assert.equal(an.requests.length, 2);
+  // ИИ спросили уже после черновика: он видит его в переписке и отвечает только на новое
+  assert.ok(JSON.stringify(an.requests[1].body.messages).includes(DRAFT));
+  assert.equal(conv.status, "bot");
+});
+
+// ---------- «Бот, попробуй ещё» под карточкой, в черновике которой то, что бот не смог отправить ----------
+test("ответ из двух сообщений, второе не ушло, мастер нажал «Бот, попробуй ещё» — бот досылает недосланное, а не теряет его", async () => {
+  const app = await makeApp();
+  const WHERE = "Мы на ул. Примерной, 1.";
+  an.respond = () => confident(`${STARTED}\n\n${WHERE}`);
+  failSends(651, { times: 1, when: (p) => /Примерной/.test(p.text), err: ERR500 });
+  await clientSays(app, 651, "Сколько стоит стрижка и где вы?");
+  await app.idle();
+  const conv = lastConv(app);
+  assert.deepEqual(delivered(651), [STARTED]);
+  assert.equal(conv.status, "waiting");
+  assert.equal(conv.handoff.draft, WHERE);
+  assert.ok(buttons(cards()[0]).includes(`c:retry:${conv.id}`));
+
+  // Первое сообщение уже считается ответом на вопрос: ИИ заново не спросят, и второе пропало бы молча
+  await press(app, `c:retry:${conv.id}`);
+  await app.idle();
+  assert.equal(tg.of("answerCallbackQuery").at(-1).params.text, "Отправляю");
+  assert.deepEqual(delivered(651), [STARTED, WHERE]);
+  assert.equal(conv.status, "bot");
+  assert.equal(an.requests.length, 1);
+  assert.equal(cards().length, 1);
+});
+
+test("ответ не ушёл, клиент тем временем прислал фото, мастер нажал «Бот, попробуй ещё» — ответ уходит, а фото снова ждёт мастера", async () => {
+  const app = await makeApp();
+  an.respond = () => confident(STARTED);
+  const conv = await interruptedThenSendFails(app, 652, () => clientSays(app, 652, undefined, PHOTO));
+  assert.equal(conv.status, "waiting");
+  assert.equal(conv.handoff.draft, STARTED);
+  assert.equal(conv.handoff.draftAfter, 1);
+
+  slowTyping(app, 20);
+  await press(app, `c:retry:${conv.id}`);
+  await app.idle();
+  assert.deepEqual(delivered(652), [STARTED, "Посмотрю и скоро отвечу"]);
+  assert.equal(conv.status, "waiting");
+  assert.equal(conv.handoff.question, "[фото]");
+  assert.equal(an.requests.length, 1);
+  assert.equal(cards().length, 2);
+});
+
+// ---------- своё «уточню» не ушло: в черновик возвращается только то начатое, что ИИ перенёс в него как есть ----------
+test("своё «уточню» не ушло, а начатый ответ ИИ в нём переписал (клиент уточнил вопрос) — устаревшее начатое в черновик не попадает", async () => {
+  const app = await makeApp();
+  const hold = "Стрижка с бородой — 2 700 ₽. Про скидку уточню и скоро отвечу.";
+  an.respond = (body, n) => (n === 1 ? confident(STARTED) : callsMaster(NEW_ONLY, hold));
+  const conv = await interruptedThenSendFails(app, 654, () => clientSays(app, 654, "Ой, с бородой. А студентам скидка есть?"));
+  assert.deepEqual(delivered(654), []);
+  assert.equal(sendFailures().length, 1);
+  // Что не ушло, мастера видят в предупреждении, а одним нажатием устаревшую цену клиенту не отправить
+  assert.match(sendFailures()[0].params.text, /Не ушло: «Стрижка с бородой — 2 700 ₽\. Про скидку уточню и скоро отвечу\.»/);
+  assert.equal(conv.status, "waiting");
+  assert.equal(cards().length, 1);
+  assert.equal(conv.handoff.draft, NEW_ONLY);
+  assert.equal(conv.handoff.draftAfter, null);
+});
+
+test("своё «уточню» не ушло, а начатый ответ из двух сообщений стоит в нём одной строкой и в другом порядке — он всё равно возвращается в черновик", async () => {
+  const app = await makeApp();
+  const PRICES = `${STARTED}\nДетская — 1 200 ₽.`; // одно сообщение в две строки
+  const WHERE = "Мы на ул. Примерной, 1.";
+  an.respond = (body, n) =>
+    n === 1
+      ? confident(`${PRICES}\n\n${WHERE}`)
+      : callsMaster(NEW_ONLY, `${WHERE} ${STARTED} Детская — 1 200 ₽. Про скидку уточню и скоро отвечу.`);
+  slowTyping(app, 400);
+  await clientSays(app, 655, "Сколько стоит стрижка и где вы?");
+  await waitFor(() => typingCalls(655));
+  failSends(655, { times: 1, err: ERR500 });
+  await clientSays(app, 655, "А студентам скидка есть?");
+  await app.idle();
+
+  const conv = lastConv(app);
+  assert.deepEqual(delivered(655), []);
+  assert.equal(cards().length, 2);
+  assert.equal(conv.handoff.draft, `${PRICES}\n\n${WHERE}\n\n${NEW_ONLY}`);
+  assert.equal(conv.handoff.draftAfter, null);
+});
+
+test("своё «уточню» не ушло, а черновик ИИ — ровно начатый ответ: в черновике он один раз, и новый вопрос после отправки снова ждёт мастера", async () => {
+  const app = await makeApp();
+  const conv = await ownHoldFails(app, 656, STARTED);
+  assert.equal(cards().length, 2);
+  assert.equal(conv.handoff.draft, STARTED);
+  assert.equal(conv.handoff.draftAfter, 1); // черновик отвечает только на первый вопрос
+  assert.ok(buttons(cards()[1]).includes(`c:send:${conv.id}`));
+
+  slowTyping(app, 20);
+  await press(app, `c:send:${conv.id}`);
+  await app.idle();
+  assert.deepEqual(delivered(656), [STARTED, "Про скидку уточню и скоро отвечу."]);
+  assert.equal(conv.status, "waiting");
+  assert.equal(conv.handoff.question, "А студентам скидка есть?");
+  assert.equal(an.requests.length, 3);
+  assert.equal(cards().length, 3);
+});
+
+test("своё «уточню» не ушло, а из двух сообщений начатого ответа ИИ перенёс в него только одно — в черновик начатое не возвращается", async () => {
+  const app = await makeApp();
+  const WHERE = "Мы на ул. Примерной, 1.";
+  an.respond = (body, n) => (n === 1 ? confident(`${STARTED}\n\n${WHERE}`) : callsMaster(NEW_ONLY, `${WHERE} Про скидку уточню и скоро отвечу.`));
+  slowTyping(app, 400);
+  await clientSays(app, 657, "Сколько стоит стрижка и где вы?");
+  await waitFor(() => typingCalls(657));
+  failSends(657, { times: 1, err: ERR500 });
+  await clientSays(app, 657, "Ой, цену не надо. А студентам скидка есть?");
+  await app.idle();
+
+  const conv = lastConv(app);
+  assert.deepEqual(delivered(657), []);
+  assert.equal(sendFailures().length, 1);
+  assert.equal(cards().length, 1);
+  assert.equal(conv.handoff.draft, NEW_ONLY);
+});
+
+test("ответ из двух сообщений, второе не ушло, мастер нажал старую кнопку «Вернуть боту» — бот тоже сначала досылает недосланное", async () => {
+  const app = await makeApp();
+  const WHERE = "Мы на ул. Примерной, 1.";
+  an.respond = () => confident(`${STARTED}\n\n${WHERE}`);
+  failSends(658, { times: 1, when: (p) => /Примерной/.test(p.text), err: ERR500 });
+  await clientSays(app, 658, "Сколько стоит стрижка и где вы?");
+  await app.idle();
+  const conv = lastConv(app);
+  assert.equal(conv.status, "waiting");
+  assert.equal(conv.handoff.draft, WHERE);
+
+  await press(app, `c:bot:${conv.id}`);
+  await app.idle();
+  assert.equal(tg.of("answerCallbackQuery").at(-1).params.text, "Отправляю");
+  assert.deepEqual(delivered(658), [STARTED, WHERE]);
+  assert.equal(conv.status, "bot");
+  assert.equal(an.requests.length, 1);
+});
+
+// Вопрос в карточке после сбоя отправки. Первое сообщение ответа ушло — по переписке вопрос клиента уже «с ответом»,
+// но мастеру он нужен: без него не понять, на что отвечает черновик, а «Запомнить мой ответ» записала бы пустой вопрос
+
+const ASKED = "Сколько стоит стрижка и где вы?";
+const WHERE = "Мы на ул. Примерной, 1.";
+const secondPartFails = async (app, chatId) => {
+  an.respond = () => confident(`${STARTED}\n\n${WHERE}`);
+  failSends(chatId, { times: 1, when: (p) => /Примерной/.test(p.text), err: ERR500 });
+  await clientSays(app, chatId, ASKED);
+  await app.idle();
+  const conv = lastConv(app);
+  assert.deepEqual(delivered(chatId), [STARTED]);
+  assert.equal(conv.handoff.draft, WHERE);
+  return conv;
+};
+
+test("ответ из двух сообщений, второе не ушло — в карточке мастер видит вопрос, на который бот отвечал", async () => {
+  const app = await makeApp();
+  const conv = await secondPartFails(app, 653);
+  assert.equal(conv.handoff.question, ASKED);
+  assert.ok(card().params.text.includes(`💬 «${ASKED}»`));
+  assert.equal(cards().length, 1);
+});
+
+test("второе сообщение ответа не ушло, мастер ответил сам и вернул диалог боту — «Запомнить мой ответ» запоминает вопрос клиента, а не пустоту", async () => {
+  const app = await makeApp();
+  const conv = await secondPartFails(app, 659);
+  await press(app, `c:take:${conv.id}`);
+  await adminSays(app, "Мы на Примерной, 1, вход со двора");
+  await press(app, `c:bot:${conv.id}`);
+  await app.idle();
+  assert.deepEqual(conv.lastQA, { q: ASKED, a: "Мы на Примерной, 1, вход со двора" });
+  await press(app, `c:learn:${conv.id}`);
+  assert.equal(app.shop.knowledge.at(-1).text, `Клиент спросил: «${ASKED}». Ответ мастера: «Мы на Примерной, 1, вход со двора».`);
+});
+
+test("второе сообщение ответа не ушло, а клиент за это время дописал — в карточке и прежний вопрос, и новое", async () => {
+  const app = await makeApp();
+  an.respond = () => confident(`${STARTED}\n\n${WHERE}`);
+  let failed = false;
+  tg.fail = (method, p) => {
+    if (method !== "sendMessage" || String(p.chat_id) !== "660" || !/Примерной/.test(p.text) || failed) return null;
+    failed = true;
+    tg.calls.at(-1).failed = true;
+    clientSays(app, 660, "А парковка есть?"); // клиент дописал, пока второе сообщение было в пути
+    return ERR500;
+  };
+  await clientSays(app, 660, ASKED);
+  await app.idle();
+
+  const conv = lastConv(app);
+  assert.equal(conv.status, "waiting");
+  assert.equal(conv.handoff.question, `${ASKED}\nА парковка есть?`);
+  assert.equal(cards().length, 1);
+});
+
+test("Business: ответ не ушёл, а сообщение клиента бот уже отметил прочитанным — карточка не говорит, что оно осталось непрочитанным", async () => {
+  const app = await makeApp();
+  await bizConnect(app);
+  an.respond = () => confident(STARTED);
+  failSends(661, { times: 1, err: ERR500 });
+  const mid = await bizSays(app, 661, "Сколько стоит стрижка?");
+  await app.idle();
+
+  const conv = lastConv(app);
+  assert.equal(conv.status, "waiting");
+  assert.deepEqual(delivered(661), []);
+  assert.deepEqual(tg.of("readBusinessMessage").map((c) => c.params.message_id), [mid]);
+  assert.deepEqual(conv.unread, []);
+  assert.match(card().params.text, /не удалось отправить ответ клиенту/);
+  assert.ok(card().params.text.endsWith("\n<i>Ответить можно прямо в своём Telegram.</i>"));
+});
+
+// Та же защита, когда диалог уже у мастера: он взял его, пока карточка ещё рассылалась, и сразу вернул боту.
+// Проход бота ещё не закончился — кнопка просит подождать, диалог остаётся у мастера
+
+const takesThenPresses = (app, data) => {
+  let pressed = null;
+  tg.fail = (method, p) => {
+    if (!pressed && method === "sendMessage" && String(p.chat_id) === String(OWNER) && /Нужен ответ мастера/.test(p.text)) {
+      const conv = lastConv(app);
+      app.takeover(conv, OWNER, { quiet: true }); // «Взять диалог» — и сразу вторая кнопка, карточка ещё в пути
+      pressed = press(app, `${data}:${conv.id}`);
+    }
+    return null;
+  };
+  return async () => {
+    await waitFor(() => pressed);
+    await pressed;
+    await app.idle();
+  };
+};
+
+for (const [button, data, chatId] of [
+  ["«Вернуть боту»", "c:bot", 662],
+  ["«Бот, попробуй ещё»", "c:retry", 663],
+]) {
+  test(`мастер взял диалог, пока карточка ещё рассылалась, и сразу нажал ${button} — бот просит подождать, диалог остаётся у мастера`, async () => {
+    const app = await makeApp({ env: { ADMIN_IDS: "200" } });
+    an.respond = callsMasterAgain;
+    const pressed = takesThenPresses(app, data);
+    await clientSays(app, chatId, "Можно прийти с собакой?");
+    await pressed();
+
+    const conv = lastConv(app);
+    assert.deepEqual(answersByPress(), [[BOT_BUSY]]);
+    assert.equal(conv.status, "admin");
+    assert.equal(conv.handledBy, OWNER);
+    assert.equal(an.requests.length, 1);
+    assert.equal(cards().length, 1);
+  });
+}
+
+test("в карточке черновик ИИ, а не недосланное — старая кнопка «Вернуть боту» клиенту его не отправляет, бот отвечает заново", async () => {
+  const app = await makeApp();
+  const conv = await waitingWithDraft(app, 664);
+  an.respond = () => confident("С небольшой собакой можно.");
+  await press(app, `c:bot:${conv.id}`);
+  await app.idle();
+
+  assert.equal(tg.of("answerCallbackQuery").at(-1).params.text, "Бот снова ведёт диалог");
+  assert.deepEqual(texts(664), [HOLD, "С небольшой собакой можно."]);
+  assert.equal(an.requests.length, 2);
+  assert.equal(conv.status, "bot");
+});
+
+// «Бот ещё занят» — только про этот диалог: пока ИИ думает над вопросом другого клиента, кнопки мастера работают сразу
+
+const busyWithAnotherClient = async (app, chatId, otherChatId) => {
+  let handedOff = false;
+  an.respond = (body) => {
+    if (/стрижка/.test(String(body.messages.at(-1).content))) return { delayMs: 500, response: confident(STARTED) };
+    return handedOff ? confident("Да, с собакой можно.") : callsMasterAgain();
+  };
+  await clientSays(app, chatId, "Можно прийти с собакой?");
+  await app.idle();
+  const conv = lastConv(app);
+  assert.equal(conv.status, "waiting");
+  handedOff = true;
+  const asked = an.requests.length;
+  await clientSays(app, otherChatId, "Сколько стоит стрижка?");
+  await waitFor(() => an.requests.length > asked); // ИИ думает над вопросом второго клиента
+  assert.equal(app.busy.size, 1);
+  assert.ok(!app.busy.has(conv.id));
+  return conv;
+};
+
+test("«Бот, попробуй ещё», пока бот занят другим клиентом, — срабатывает сразу", async () => {
+  const app = await makeApp();
+  const conv = await busyWithAnotherClient(app, 665, 666);
+  await press(app, `c:retry:${conv.id}`);
+  assert.deepEqual(answersByPress(), [["Бот пробует ещё раз"]]);
+  await app.idle();
+  assert.deepEqual(delivered(665), [HOLD, "Да, с собакой можно."]);
+  assert.deepEqual(delivered(666), [STARTED]);
+  assert.equal(conv.status, "bot");
+});
+
+test("«Вернуть боту», пока бот занят другим клиентом, — срабатывает сразу", async () => {
+  const app = await makeApp();
+  const conv = await busyWithAnotherClient(app, 667, 668);
+  await press(app, `c:take:${conv.id}`);
+  assert.equal(app.busy.size, 1);
+  await press(app, `c:bot:${conv.id}`);
+  assert.deepEqual(answersByPress(), [["Диалог ваш"], ["Бот снова ведёт диалог"]]);
+  await app.idle();
+  assert.deepEqual(delivered(667), [HOLD, "Да, с собакой можно."]);
+  assert.deepEqual(delivered(668), [STARTED]);
+  assert.equal(conv.status, "bot");
+});
+
+test("«Отправить черновик», пока бот занят другим клиентом, — черновик уходит сразу", async () => {
+  const app = await makeApp();
+  const conv = await waitingWithDraft(app, 669);
+  an.respond = () => ({ delayMs: 500, response: confident(STARTED) });
+  const asked = an.requests.length;
+  await clientSays(app, 670, "Сколько стоит стрижка?");
+  await waitFor(() => an.requests.length > asked); // ИИ думает над вопросом второго клиента
+  assert.equal(app.busy.size, 1);
+  assert.ok(!app.busy.has(conv.id));
+
+  await press(app, `c:send:${conv.id}`);
+  assert.deepEqual(answersByPress(), [["Отправляю"]]);
+  await app.idle();
+  assert.deepEqual(delivered(669), [HOLD, DRAFT]);
+  assert.deepEqual(delivered(670), [STARTED]);
+  assert.equal(conv.status, "bot");
 });
