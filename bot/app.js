@@ -454,12 +454,12 @@ class App {
         }
         const out = await this.deliver(conv, result.text, "bot", { after: seen, stopIf: outdated });
         if (out.failed) {
-          // Мастерам о сбое уже написали, ИИ впустую не крутим. Но фото или голосовое, которые клиент прислал
-          // тем временем, разберёт только мастер: следующий круг передаст их ему вместе с тем, что не ушло.
+          // Ответ не ушёл. ИИ впустую не крутим и клиенту больше не пишем: диалог переходит к мастеру, а то,
+          // что не ушло, — в черновик, чтобы отправить ещё раз одним нажатием. Что клиент прислал уже после
+          // этого ответа (фото, голосовое), после отправки черновика бот разберёт как обычно.
           [lost, lostAfter] = [out.unsent, seen];
-          draft = null;
-          if (!this.pendingClientMessages(conv).some((m) => m.needsHuman)) return;
-          continue;
+          if (conv.status === "bot") await toMaster(conv, { reason: `не удалось отправить ответ клиенту: ${out.error}` });
+          return;
         }
         draft = out.unsent ? { text: out.unsent, after: seen } : null;
         // следующий круг ответит на то, что клиент написал, пока бот думал или «печатал»
@@ -560,13 +560,14 @@ class App {
       } catch (e) {
         this.log.error("Не удалось отправить клиенту:", e.message);
         this.save();
+        const unsent = parts.slice(i).join("\n\n");
         await this.notifyAdmins(
-          `⚠️ Не удалось отправить сообщение клиенту <b>${esc(conv.client.name)}</b>: ${esc(e.message)}`,
+          `⚠️ Не удалось отправить сообщение клиенту <b>${esc(conv.client.name)}</b>: ${esc(e.message)}\nНе ушло: «${esc(truncate(unsent, 700))}»`,
           [[{ text: "📜 Переписка", callback_data: `c:open:${conv.id}` }]],
           null,
           { except: by }
         );
-        return { failed: true, unsent: parts.slice(i).join("\n\n"), error: e.message };
+        return { failed: true, unsent, error: e.message };
       }
     }
     this.save();

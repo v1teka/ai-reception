@@ -478,15 +478,28 @@ test("после «Завершить диалог» новый вопрос —
   assert.equal(conv.handoff.question, "А скидка для студентов есть?");
 });
 
-test("клиент заблокировал бота — бот не повторяет ответ по кругу: один запрос к ИИ, одно предупреждение", async () => {
+test("клиент заблокировал бота — бот не повторяет ответ по кругу: один запрос к ИИ, одно предупреждение, диалог переходит к мастеру", async () => {
   const app = await makeApp();
   tg.fail = (method, p) => method === "sendMessage" && p.chat_id === 555 && { code: 403, description: "Forbidden: bot was blocked by the user" };
   an.respond = () => confident("Здравствуйте!");
   await clientSays(app, 555, "Привет");
   await app.idle();
   assert.equal(an.requests.length, 1);
-  assert.equal(tg.sentTo(OWNER).filter((m) => /Не удалось отправить/.test(m.params.text)).length, 1);
-  assert.equal(lastConv(app).status, "bot");
+  assert.equal(tg.sentTo(555).length, 1); // одна попытка: ни повтора, ни «уточню»
+  const alerts = tg.sentTo(OWNER).filter((m) => /Не удалось отправить/.test(m.params.text));
+  assert.equal(alerts.length, 1);
+  assert.equal(
+    alerts[0].params.text,
+    "⚠️ Не удалось отправить сообщение клиенту <b>Иван</b>: Telegram sendMessage: 403 Forbidden: bot was blocked by the user\nНе ушло: «Здравствуйте!»"
+  );
+  // Вопрос клиента без хозяина не остаётся: диалог ждёт мастера, а неотправленный ответ лежит в черновике
+  const conv = lastConv(app);
+  assert.equal(conv.status, "waiting");
+  assert.equal(conv.handoff.draft, "Здравствуйте!");
+  assert.equal(conv.handoff.hold, "");
+  const card = tg.sentTo(OWNER).filter((m) => /Нужен ответ мастера/.test(m.params.text));
+  assert.equal(card.length, 1);
+  assert.match(card[0].params.text, /не удалось отправить ответ клиенту: Telegram sendMessage: 403 Forbidden: bot was blocked by the user/);
 });
 
 // ---------- запись ----------
@@ -1838,7 +1851,7 @@ test("клиент дописал, пока уходил черновик, от�
   // Диалог ведёт мастер: «ждёт ответа» было бы неправдой, а дописанное он видит в переписке
   const [toOwner, toMaster] = [OWNER, MASTER].map((id, i) => tg.sentTo(id).slice(told[i]).map((m) => m.params.text));
   assert.deepEqual(toOwner, ["⚠️ Не удалось отправить черновик клиенту <b>Иван</b>: Telegram sendMessage: 500 Internal Server Error"]);
-  assert.deepEqual(toMaster, ["⚠️ Не удалось отправить сообщение клиенту <b>Иван</b>: Telegram sendMessage: 500 Internal Server Error"]);
+  assert.deepEqual(toMaster, [`⚠️ Не удалось отправить сообщение клиенту <b>Иван</b>: Telegram sendMessage: 500 Internal Server Error\nНе ушло: «${DRAFT}»`]);
 });
 
 test("черновик не ушёл — остальным мастерам приходит общее предупреждение, нажавшему только своё", async () => {
@@ -1854,7 +1867,7 @@ test("черновик не ушёл — остальным мастерам п�
   const [toOwner, toMaster] = [OWNER, MASTER].map((id, i) => tg.sentTo(id).slice(told[i]).map((m) => m.params.text));
   assert.equal(toMaster.length, 1);
   assert.match(toMaster[0], /^⚠️ Не удалось отправить черновик клиенту <b>Иван<\/b>: .*\nДиалог снова ждёт ответа/);
-  assert.deepEqual(toOwner, ["⚠️ Не удалось отправить сообщение клиенту <b>Иван</b>: Telegram sendMessage: 403 Forbidden: bot was blocked by the user"]);
+  assert.deepEqual(toOwner, [`⚠️ Не удалось отправить сообщение клиенту <b>Иван</b>: Telegram sendMessage: 403 Forbidden: bot was blocked by the user\nНе ушло: «${DRAFT}»`]);
 });
 
 test("клиент написал в ту секунду, когда мастер нажал «Отправить черновик», — черновик уходит, а на новое бот отвечает следом", async () => {
@@ -2792,7 +2805,7 @@ test("клиент дописал текст и следом фото, а нач
 
 // Фото ответ на прежний вопрос не меняет, поэтому бот его дописывает. Но если он не ушёл, фото не должно
 // остаться без внимания: кроме мастера, его никто не разберёт.
-test("клиент прислал фото, пока бот «печатал», а ответ не ушёл — фото всё равно попадает мастеру, ответ остаётся в черновике", async () => {
+test("клиент прислал фото, пока бот «печатал», а ответ не ушёл — диалог у мастера, ответ в черновике, а фото после отправки снова ждёт мастера", async () => {
   const app = await makeApp();
   an.respond = () => confident(STARTED);
   const conv = await interruptedThenSendFails(app, 622, () => clientSays(app, 622, undefined, PHOTO));
@@ -2803,7 +2816,8 @@ test("клиент прислал фото, пока бот «печатал», 
   assert.equal(sendFailures().length, 1);
   assert.equal(conv.status, "waiting");
   assert.equal(cards().length, 1);
-  assert.match(cards()[0].params.text, /клиент прислал фото/);
+  assert.match(cards()[0].params.text, /не удалось отправить ответ клиенту: Telegram sendMessage: 500 Internal Server Error/);
+  assert.equal(conv.handoff.question, "Сколько стоит стрижка?\n[фото]");
   assert.equal(conv.handoff.draft, STARTED);
   assert.equal(conv.handoff.hold, "");
 
@@ -2818,7 +2832,7 @@ test("клиент прислал фото, пока бот «печатал», 
   assert.match(cards().at(-1).params.text, /клиент прислал фото/);
 });
 
-test("ответ не ушёл, а больше клиент ничего не присылал — мастерам сказано о сбое, диалог остаётся у бота, ИИ заново не зовём", async () => {
+test("обычный ответ не ушёл из-за сбоя Telegram — диалог ждёт мастера, ответ в черновике и уходит одним нажатием, ИИ заново не зовём", async () => {
   const app = await makeApp();
   an.respond = () => confident(STARTED);
   failSends(623, { times: 1, err: { code: 500, description: "Internal Server Error" } });
@@ -2827,10 +2841,65 @@ test("ответ не ушёл, а больше клиент ничего не �
 
   const conv = lastConv(app);
   assert.equal(an.requests.length, 1);
+  assert.deepEqual(texts(623), [STARTED]); // одна попытка, «уточню» следом не пишем
   assert.deepEqual(delivered(623), []);
   assert.equal(sendFailures().length, 1);
+  assert.match(sendFailures()[0].params.text, /\nНе ушло: «Мужская стрижка — 1 800 ₽\.»$/);
+  assert.equal(conv.status, "waiting");
+  assert.equal(cards().length, 1);
+  assert.match(cards()[0].params.text, /💬 «Сколько стоит стрижка\?»/);
+  assert.match(cards()[0].params.text, /Черновик бота: «Мужская стрижка — 1 800 ₽\.»/);
+  assert.doesNotMatch(cards()[0].params.text, /Клиенту пишу/);
+  assert.ok(buttons(cards()[0]).includes(`c:send:${conv.id}`));
+  await press(app, "m:list:waiting");
+  assert.match(tg.of("editMessageText").at(-1).params.text, /<b>Иван<\/b>/);
+
+  await press(app, `c:send:${conv.id}`);
+  await app.idle();
+  assert.deepEqual(delivered(623), [STARTED]);
   assert.equal(conv.status, "bot");
+  assert.equal(an.requests.length, 1);
+  assert.equal(cards().length, 1);
+});
+
+test("ответ из двух сообщений, второе не ушло — диалог ждёт мастера, в черновике только то, что не ушло", async () => {
+  const app = await makeApp();
+  const WHERE = "Мы на ул. Примерной, 1.";
+  an.respond = () => confident(`${STARTED}\n\n${WHERE}`);
+  failSends(635, { times: 1, when: (p) => /Примерной/.test(p.text), err: { code: 500, description: "Internal Server Error" } });
+  await clientSays(app, 635, "Сколько стоит стрижка и где вы?");
+  await app.idle();
+
+  const conv = lastConv(app);
+  assert.deepEqual(delivered(635), [STARTED]);
+  assert.equal(conv.status, "waiting");
+  assert.equal(conv.handoff.draft, WHERE);
+  await press(app, `c:send:${conv.id}`);
+  await app.idle();
+  assert.deepEqual(delivered(635), [STARTED, WHERE]);
+  assert.equal(conv.status, "bot");
+  assert.equal(an.requests.length, 1);
+});
+
+test("ответ не ушёл, а диалог в эту секунду взял мастер — карточка «нужен мастер» ему не приходит", async () => {
+  const app = await makeApp();
+  an.respond = () => confident(STARTED);
+  let failed = false;
+  tg.fail = (method, p) => {
+    if (method !== "sendMessage" || String(p.chat_id) !== "636" || failed) return null;
+    failed = true;
+    tg.calls.at(-1).failed = true;
+    app.takeover(lastConv(app), OWNER, { quiet: true }); // «Взять диалог», пока сообщение было в пути
+    return { code: 500, description: "Internal Server Error" };
+  };
+  await clientSays(app, 636, "Сколько стоит стрижка?");
+  await app.idle();
+
+  assert.ok(failed);
+  assert.equal(lastConv(app).status, "admin");
+  assert.equal(lastConv(app).handoff, null);
   assert.equal(cards().length, 0);
+  assert.equal(sendFailures().length, 1);
 });
 
 test("клиент дописал, лимит запросов к ИИ исчерпан, а начатый ответ не ушёл — карточка мастеру всё равно приходит", async () => {
@@ -3013,7 +3082,17 @@ test("бот переписал ответ, клиент прислал фото
   assert.equal(sendFailures().length, 1);
   assert.equal(conv.status, "waiting");
   assert.equal(conv.handoff.draft, REDONE);
-  assert.match(cards().at(-1).params.text, /клиент прислал фото/);
+  assert.equal(conv.handoff.question, "Сколько стоит стрижка?\nОй, с бородой\n[фото]");
+  assert.equal(cards().length, 1);
+  assert.match(cards()[0].params.text, /не удалось отправить ответ клиенту/);
+
+  // Мастер отправил новый ответ — фото после этого снова попадает к нему
+  await press(app, `c:send:${conv.id}`);
+  await app.idle();
+  assert.deepEqual(delivered(628), [REDONE, "Посмотрю и скоро отвечу"]);
+  assert.equal(conv.status, "waiting");
+  assert.equal(conv.handoff.question, "[фото]");
+  assert.equal(an.requests.length, 2);
 });
 
 // ---------- начатый ответ не ушёл, а в черновике ИИ — только про новое ----------
@@ -3097,4 +3176,23 @@ test("elsewhereNote: подсказка нужна, только если обы
   await press(app, `c:take:${first.id}`);
   assert.equal(app.elsewhereNote(a, first), ""); // пишет как раз этому клиенту
   assert.equal(app.elsewhereNote(a, second), "Обычные сообщения сейчас уходят клиенту <b>Иван</b>.");
+});
+
+test("mayHold: напоминание после «уточню» — не повод обещать ещё раз, а новое сообщение клиента — повод, но только для слов самого ИИ", async () => {
+  const app = await makeApp();
+  const conv = {
+    id: "c-may-hold",
+    session: { startedAt: 0 },
+    messages: [
+      { role: "client", text: "Можно прийти с собакой?", seq: 1, at: 1 },
+      { role: "bot", text: DOG_HOLD, hold: true, seq: 2, at: 2 },
+      { role: "bot", text: "Напоминаю: завтра в 12:00 у вас стрижка.", notice: true, seq: 3, at: 3 },
+    ],
+  };
+  assert.equal(app.mayHold(conv, "Про собаку ещё уточняю.", true), false);
+  conv.messages.push({ role: "client", text: "А сколько стоит стрижка?", seq: 4, at: 4 });
+  assert.equal(app.mayHold(conv, STARTED, true), true);
+  assert.equal(app.mayHold(conv, "Уточню и скоро вам отвечу", false), false); // стандартную фразу не повторяем
+  assert.equal(app.mayHold(conv, DOG_HOLD, true), false); // слово в слово то же самое
+  assert.equal(app.mayHold(conv, "", true), false);
 });
