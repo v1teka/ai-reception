@@ -18,6 +18,8 @@ const ALLOWED_UPDATES = [
   "business_message",
   "edited_business_message",
   "deleted_business_messages",
+  // Реакции клиента в чате с ботом (Telegram присылает их, только если попросить явно)
+  "message_reaction",
 ];
 
 class TelegramApi {
@@ -28,7 +30,7 @@ class TelegramApi {
     this.me = null;
   }
 
-  async call(method, params = {}, { timeoutMs = 20000 } = {}) {
+  async call(method, params = {}, { timeoutMs = 20000, body = null } = {}) {
     for (let attempt = 0; ; attempt++) {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -36,8 +38,7 @@ class TelegramApi {
       try {
         const res = await fetch(`${this.base}/bot${this.token}/${method}`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(params),
+          ...(body ? { body: body() } : { headers: { "content-type": "application/json" }, body: JSON.stringify(params) }),
           signal: ctrl.signal,
         });
         data = await res.json().catch(() => ({ ok: false, error_code: res.status, description: res.statusText }));
@@ -53,6 +54,17 @@ class TelegramApi {
       }
       throw err;
     }
+  }
+
+  // Отправить файл (sendPhoto, sendDocument…) загрузкой, а не по file_id: file_id другого бота не подходит
+  upload(method, params, field, buffer, filename) {
+    const body = () => {
+      const form = new FormData();
+      for (const [k, v] of Object.entries(params)) if (v != null) form.append(k, typeof v === "object" ? JSON.stringify(v) : String(v));
+      form.append(field, new Blob([buffer]), filename);
+      return form;
+    };
+    return this.call(method, params, { timeoutMs: 60000, body });
   }
 
   async getMe() {
