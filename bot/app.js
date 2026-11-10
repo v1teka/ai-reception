@@ -289,6 +289,11 @@ class App {
     return conv.messages.some((m) => m.role === "client" && !m.service && !m.needsHuman && m.seq > seq);
   }
 
+  // Мастер написал клиенту после сообщения номер seq: ответил сам или, например, отменил его запись из панели
+  masterWroteSince(conv, seq) {
+    return conv.messages.some((m) => m.role === "admin" && m.seq > seq);
+  }
+
   isOwnChat(conv, adminId) {
     return conv.kind === "direct" && Number(conv.chatId) === Number(adminId);
   }
@@ -375,12 +380,14 @@ class App {
       let lost = "";
       let lostAfter = null;
       let lostError = "";
-      const flush = async (conv) => {
+      // stopIf — бросить, если клиент дописал, пока бот «печатал»: остаток снова станет начатым ответом.
+      const flush = async (conv, stopIf = null) => {
         if (draft) {
-          const { text, after } = draft;
+          const started = draft;
           draft = null;
-          const out = await this.deliver(conv, text, "bot", { after });
-          if (out.failed) [lost, lostAfter, lostError] = [out.unsent, after, out.error];
+          const out = await this.deliver(conv, started.text, "bot", { after: started.after, stopIf });
+          if (out.failed) [lost, lostAfter, lostError] = [out.unsent, started.after, out.error];
+          else if (out.unsent) draft = { ...started, text: out.unsent };
         }
         return conv.status === "bot";
       };
@@ -400,11 +407,12 @@ class App {
         if (!conv || conv.status !== "bot") return;
         // Мастер вернул боту то, что не ушло из-за сбоя, а клиент с тех пор ничего не написал: ответ по-прежнему
         // верен и уходит как есть, ИИ заново не зовём. (Обычный начатый ответ сюда не попадает: он появляется,
-        // только когда клиент дописал.) Написал — ниже ИИ увидит этот ответ как неотправленный и решит сам.
+        // только когда клиент дописал.) Написал — ниже ИИ увидит этот ответ как неотправленный и решит сам. То же,
+        // если клиент дописал, пока бот «печатал» досылаемое: как любой ответ, оно не уходит, и остаток увидит ИИ.
         if (draft && !this.wroteSince(conv, draft.after)) {
-          const { question = "", upTo = 0 } = draft;
-          if (!(await flush(conv))) return;
-          if (!lost) continue; // дальше — то, что клиент прислал после (фото, голосовое), если есть
+          const { question = "", upTo = 0, after } = draft;
+          if (!(await flush(conv, () => this.wroteSince(conv, after)))) return;
+          if (!lost) continue; // дальше — то, что клиент прислал после (фото, голосовое) или дописал сейчас
           // Снова не ушло: диалог опять ждёт мастера. В вопросе — прежний вопрос и то, что клиент прислал после него
           const more = this.pendingClientMessages(conv).filter((m) => m.seq > upTo).map((m) => m.text);
           await sendFailed(conv, [question, ...more].filter(Boolean).join("\n"));
@@ -719,8 +727,8 @@ class App {
   // by — мастер, который нажал кнопку: ему скажут об этом там, где он нажал
   // resume — бот продолжает с того места, где позвал мастера («Бот, попробуй ещё», «Вернуть боту»). То, что он
   // уже отправлял клиенту и не смог (handoff.lost), остаётся за ним: с этого начнётся следующий проход
-  // (processConv). Так же, если мастер взял диалог и вернул, ничего клиенту не написав. А если мастер ответил
-  // сам или диалог завершили, недосланное больше не нужно.
+  // (processConv). Так же, если мастер взял диалог и вернул, ничего клиенту не написав. А если мастер после
+  // недосланного сам написал клиенту или диалог завершили, оно больше не нужно.
   // Сам проход бота запускает тот, кто вернул диалог.
   async returnToBot(conv, { by = null, resume = false } = {}) {
     const taken = conv.status === "admin" ? conv.takenHandoff : null;
@@ -731,9 +739,13 @@ class App {
           .filter((m) => m.role === "admin" && m.at >= taken.at)
           .map((m) => m.text)
           .join("\n");
-    const waited = !resume ? null : conv.status === "waiting" ? conv.handoff : answer ? null : taken;
+    // Карточка, по которой бот звал мастера: диалог её ещё ждёт или мастер по ней взял диалог
+    const called = conv.status === "waiting" ? conv.handoff : taken;
+    // Недосланное остаётся за ботом, только пока после него клиенту не написал мастер. Брать диалог для этого
+    // не обязательно: сообщение об отмене записи из панели тоже уходит клиенту от имени мастера.
+    const lost = resume && called?.lost && !this.masterWroteSince(conv, called.lost.after) ? called.lost : null;
     // Диалог уже у бота (кнопку нажали дважды подряд, проход ещё не начался) — недосланное остаётся за ним
-    if (!resume || conv.status !== "bot") conv.unsent = waited?.lost ? { ...waited.lost, question: waited.question, upTo: waited.upTo } : null;
+    if (!resume || conv.status !== "bot") conv.unsent = lost ? { ...lost, question: called.question, upTo: called.upTo } : null;
     conv.status = "bot";
     conv.handledBy = null;
     conv.handoff = null;

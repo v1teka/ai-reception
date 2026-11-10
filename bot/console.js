@@ -1,6 +1,6 @@
 // Панель мастера в Telegram: переписки, перехват и возврат боту, записи,
 // настройки точки (Яндекс.Карты, правки словами, знания), приглашение мастера.
-const { esc, truncate, oneLine, randomCode, userName } = require("./util");
+const { esc, truncate, oneLine, randomCode, userName, atMost } = require("./util");
 const { nowParts, fmtTime, fmtDate, fmtDateRelative, addDays, ago } = require("./time");
 const { upcomingBookings, bookingLabel, cancelBooking, freeStarts } = require("./schedule");
 const { renderSummary, renderFull, demoShop, emptyShop, serviceLine } = require("./shop");
@@ -13,6 +13,8 @@ const btn = (text, data) => ({ text, callback_data: data });
 const BACK = [btn("◀️ Меню", "m:panel")];
 // Проход бота по диалогу ещё идёт (ИИ думает, бот «печатает» или рассылает карточку мастерам)
 const BOT_BUSY = "Секунду: бот ещё занят этим диалогом — нажмите ещё раз";
+// Сколько бот после «Вернуть боту» ждёт, пока мастеру уйдёт «Бот снова ведёт диалог», прежде чем отвечать клиенту
+const NOTE_WAIT_MS = 1500;
 
 // Длинный HTML режем по строкам, чтобы не упереться в лимит 4096 символов
 function chunks(text, max = 3900) {
@@ -821,11 +823,14 @@ const methods = {
           const back = this.returnToBot(conv, { by: uid, resume: true });
           const kb = conv.lastQA ? [[btn("📚 Запомнить мой ответ", `c:learn:${conv.id}`)]] : null;
           const note = `🤖 Бот снова ведёт диалог с <b>${esc(conv.client.name)}</b>.${toSetup ? " Обычные сообщения теперь идут в настройку точки." : ""}`;
-          await Promise.all([back, answer("Бот снова ведёт диалог"), this.notifyAdmin(uid, note, kb, conv.id)]);
+          const told = Promise.all([back, answer("Бот снова ведёт диалог"), this.notifyAdmin(uid, note, kb, conv.id)]);
           // Последним писал клиент (возможно, бот успел ответить «уточню») — бот отвечает по существу. Уже после
           // сообщения мастеру: если бот сразу позовёт мастера снова (клиент прислал фото), его карточка должна
-          // прийти после «Бот снова ведёт диалог», а не перед ним.
+          // прийти после «Бот снова ведёт диалог», а не перед ним. Но клиент из-за этого долго не ждёт: придержал
+          // Telegram сообщение мастеру (лимит сообщений в один чат, медленная сеть) — бот начинает, не дождавшись.
+          await atMost(told, NOTE_WAIT_MS);
           this.run(() => this.processConv(conv.id));
+          await told;
           return;
         }
         case "send": {
@@ -906,6 +911,7 @@ const methods = {
           return;
         case "close":
           conv.session = { ...(conv.session || {}), closed: true };
+          conv.unsent = null; // недосланное в завершённый диалог бот не досылает, даже если уже взялся («Бот, попробуй ещё»)
           if (conv.status !== "bot") await this.returnToBot(conv, { by: uid });
           this.save();
           await answer("Диалог завершён");

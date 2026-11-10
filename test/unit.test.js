@@ -8,6 +8,7 @@ const { typingDuration, splitReply } = require("../bot/typing");
 const { extractYandexUrl, parseOrgId, htmlToText, looksLikeCaptcha, fetchOrgText } = require("../bot/yandex");
 const { buildMessages, replyIndex, stablePrompt, dynamicPrompt } = require("../bot/assistant");
 const { Store } = require("../bot/store");
+const { atMost } = require("../bot/util");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -414,4 +415,14 @@ test("история для ИИ: «уточню» посреди вопросо
     buildMessages({ messages: withService }).map((m) => [m.role, m.content]),
     [["user", "А парковка есть?\nАу?"]]
   );
+});
+
+test("atMost: ждёт, но не дольше заданного", async () => {
+  // Дождались раньше срока — весь срок не ждём (иначе этот тест упал бы через три секунды, а не шёл минуту)
+  const tooLong = new Promise((_, fail) => setTimeout(() => fail(new Error("atMost ждал весь срок")), 3000).unref());
+  await Promise.race([atMost(Promise.resolve(), 60000), tooLong]);
+  // Не дождались — идём дальше
+  await atMost(new Promise(() => {}), 20);
+  // Сбой, случившийся раньше срока, не теряется
+  await assert.rejects(atMost(Promise.reject(new Error("сбой")), 60000), /сбой/);
 });
