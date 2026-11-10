@@ -1,6 +1,6 @@
 // Панель мастера в Telegram: переписки, перехват и возврат боту, записи,
 // настройки точки (Яндекс.Карты, правки словами, знания), приглашение мастера.
-const { esc, truncate, randomCode, userName } = require("./util");
+const { esc, truncate, oneLine, randomCode, userName } = require("./util");
 const { nowParts, fmtTime, fmtDate, fmtDateRelative, addDays, ago } = require("./time");
 const { upcomingBookings, bookingLabel, cancelBooking, freeStarts } = require("./schedule");
 const { renderSummary, renderFull, demoShop, emptyShop, serviceLine } = require("./shop");
@@ -102,16 +102,17 @@ const methods = {
         bookings.filter((b) => b.date === addDays(today, 1)).length
       }</b>`,
     ];
+    // Мастер ведёт диалог — говорим, куда уходят его обычные сообщения: «просто напишите» отправило бы
+    // проверочный вопрос его клиенту, а /panel посреди настройки закрывает её
+    const note = this.relayNote(a);
     if (hint) {
-      // Мастер ведёт диалог — «просто напишите» отправило бы проверочный вопрос его клиенту
-      const note = this.relayNote(a);
       lines.push(
         "",
         note
           ? `<i>${note} Чтобы проверить бота как клиент, сначала верните этот диалог боту.</i>`
           : "<i>Чтобы проверить бота как клиент, просто напишите ему обычное сообщение.</i>"
       );
-    }
+    } else if (note) lines.push("", `<i>${note}</i>`);
     const kb = [];
     if (l.waiting.length) kb.push([btn(`🔴 Ждут ответа (${l.waiting.length})`, "m:list:waiting")]);
     if (l.mine.length) kb.push([btn(`✋ Ведёте вы (${l.mine.length})`, "m:list:mine")]);
@@ -316,7 +317,10 @@ const methods = {
       kb.push(k.slice(i, i + 4).map((n) => btn(`🗑 ${n.id}`, `s:kdel:${n.id}`)));
     }
     kb.push([btn("◀️ Настройки", "m:settings")]);
-    return this.show(adminId, chunks(lines.join("\n"))[0], kb, cq);
+    // Заметка сохранена — настройка закрыта: если мастер ведёт диалог, следующая «заметка» ушла бы клиенту
+    const note = this.relayNote(this.admin(adminId));
+    const tail = note ? `\n\n<i>${note} Чтобы добавить заметку, нажмите «Добавить заметку».</i>` : "";
+    return this.show(adminId, chunks(lines.join("\n"), 3900 - tail.length)[0] + tail, kb, cq);
   },
 
   async showPreview(adminId, shop, changes) {
@@ -358,6 +362,16 @@ const methods = {
   relayNote(a) {
     const c = this.conv(this.dialogFocus(a));
     return c ? `Сейчас ваши сообщения уходят клиенту <b>${esc(c.client.name || "Клиент")}</b>.` : "";
+  },
+
+  // Обычное сообщение мастера ушло бы сейчас не этому клиенту (в настройку точки или другому клиенту) —
+  // фраза об этом для уведомления, иначе пусто
+  elsewhereNote(a, conv) {
+    const focus = this.dialogFocus(a);
+    if (focus === conv.id) return "";
+    const other = this.conv(focus);
+    if (other) return `Обычные сообщения сейчас уходят клиенту <b>${esc(other.client.name || "Клиент")}</b>.`;
+    return a?.mode ? "Обычные сообщения сейчас идут в настройку точки." : "";
   },
 
   // Подробности сбоя импорта (HTML) — для владельца бота
@@ -795,14 +809,25 @@ const methods = {
           // заново, иначе «Вы ведёте диалог, бот молчит» было бы неправдой
           return this.takeover(conv, uid);
         case "bot": {
+          // Его обычные сообщения шли этому клиенту, а настройка точки не закрыта — дальше они пойдут в неё
+          const toSetup = Boolean(a?.mode) && this.dialogFocus(a) === conv.id;
           await answer("Бот снова ведёт диалог");
           await this.returnToBot(conv, { by: uid });
           const kb = conv.lastQA ? [[btn("📚 Запомнить мой ответ", `c:learn:${conv.id}`)]] : null;
-          return this.notifyAdmin(uid, `🤖 Бот снова ведёт диалог с <b>${esc(conv.client.name)}</b>.`, kb, conv.id);
+          return this.notifyAdmin(
+            uid,
+            `🤖 Бот снова ведёт диалог с <b>${esc(conv.client.name)}</b>.${toSetup ? " Обычные сообщения теперь идут в настройку точки." : ""}`,
+            kb,
+            conv.id
+          );
         }
         case "send": {
           if (conv.status !== "waiting" || !conv.handoff?.draft) return answer("Черновика уже нет");
-          const draft = conv.handoff.draft;
+          // «Уточню» ещё «печатается», а в нём бывает часть ответа (начатое до того, как клиент дописал):
+          // отправь мы черновик сейчас, оно бы не ушло совсем. Пусть сначала уйдёт.
+          if (this.holding.has(conv.id)) return answer("Секунду: бот дописывает клиенту — нажмите ещё раз");
+          const handoff = conv.handoff;
+          const seen = conv.msgCount; // черновик отвечает на то, что клиент написал до этой минуты
           conv.status = "bot";
           conv.handoff = null;
           this.save();
@@ -813,11 +838,32 @@ const methods = {
             this.busy.add(conv.id);
             let out;
             try {
-              out = await this.deliver(conv, draft, "bot");
+              out = await this.deliver(conv, handoff.draft, "bot", { after: seen, by: uid });
             } finally {
               this.busy.delete(conv.id);
             }
-            if (out.failed) return; // о сбое мастерам уже написали; ИИ заново не зовём
+            if (out.failed) {
+              // Клиенту обещали ответ, а он не ушёл: диалог снова ждёт мастера, и то, что не ушло, остаётся
+              // черновиком. ИИ заново не зовём. Что клиент дописал, пока бот «печатал», показываем мастерам.
+              const back = conv.status === "bot"; // иначе диалог уже взял мастер
+              const late = back ? conv.messages.filter((m) => m.role === "client" && !m.service && m.seq > seen).map((m) => m.text) : [];
+              if (back) {
+                conv.status = "waiting";
+                conv.handoff = { ...handoff, draft: out.unsent };
+                this.save();
+              }
+              const kb = [[btn("📜 Переписка", `c:open:${conv.id}`)]];
+              if (back) kb[0].unshift(btn("✅ Отправить ещё раз", `c:send:${conv.id}`));
+              await this.notifyAdmin(
+                uid,
+                `⚠️ Не удалось отправить черновик клиенту <b>${esc(conv.client.name)}</b>: ${esc(out.error)}` +
+                  (back ? "\nДиалог снова ждёт ответа, а то, что не ушло, осталось в черновике." : ""),
+                kb,
+                conv.id
+              );
+              if (late.length) await this.notifyMoreFromClient(conv, late.join("\n"));
+              return;
+            }
             if (out.stopped) {
               const what = out.sent ? "ушёл не полностью" : "не отправлен";
               await this.notifyAdmin(
@@ -848,7 +894,8 @@ const methods = {
         case "learn": {
           if (!conv.lastQA) return answer("Нечего запоминать");
           const { q, a: ans } = conv.lastQA;
-          this.shop.knowledge.push({ id: null, text: `Клиент спросил: «${truncate(q, 500)}». Ответ мастера: «${truncate(ans, 1000)}».` });
+          // Вопрос писал клиент, а знания точки увидит ИИ в разговоре с каждым: только в кавычках и одной строкой
+          this.shop.knowledge.push({ id: null, text: `Клиент спросил: «${truncate(oneLine(q), 500)}». Ответ мастера: «${truncate(oneLine(ans), 1000)}».` });
           this.state.shop = require("./shop").normalizeShop(this.shop);
           conv.lastQA = null;
           this.save();

@@ -15,6 +15,15 @@ function truncate(s, n) {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
 
+// Чужой текст одной строкой и без «ёлочек»: внутри кавычек в подсказке для ИИ он не сможет
+// закрыть кавычку или начать новую строку и выдать себя за правило точки.
+function oneLine(s) {
+  return String(s ?? "")
+    .replace(/[«»]/g, '"')
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function randomCode(bytes = 6) {
   return crypto.randomBytes(bytes).toString("base64url");
 }
@@ -42,4 +51,4 @@ function userName(u) {
   return name || (u.username ? "@" + u.username : "Клиент");
 }
 
-module.exports = { sleep, esc, truncate, randomCode, seededRandom, clamp, userName };
+module.exports = { sleep, esc, truncate, oneLine, randomCode, seededRandom, clamp, userName };

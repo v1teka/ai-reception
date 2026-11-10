@@ -1,6 +1,6 @@
 // Ядро бота: маршрутизация апдейтов, разговоры с клиентами, ответы ИИ,
 // передача мастеру, Telegram Business, напоминания. Панель мастера — в console.js.
-const { generateReply, unansweredTail } = require("./assistant");
+const { generateReply, unansweredTail, replyIndex } = require("./assistant");
 const { typingDuration, splitReply } = require("./typing");
 const { upcomingBookings, bookingLabel, minutesUntilStart } = require("./schedule");
 const { nowParts } = require("./time");
@@ -10,6 +10,8 @@ const HOUR = 3600000;
 
 // Что написать клиенту, когда бот зовёт мастера, а ИИ сам фразу не предложил
 const HOLD_TEXT = "Уточню и скоро вам отвечу";
+// Мастеру, чьи обычные сообщения сейчас ушли бы не этому клиенту (см. elsewhereNote)
+const REPLY_HERE = "Чтобы ответить этому клиенту, ответьте реплаем на это сообщение или нажмите «Взять диалог».";
 
 // Вложения, которые бот не разбирает: поле сообщения, как назвать мастеру и что ответить клиенту сразу
 const MEDIA = [
@@ -253,14 +255,7 @@ class App {
   pushMessage(conv, m, { after } = {}) {
     conv.msgCount = (conv.msgCount || conv.messages.length) + 1;
     const msgs = conv.messages;
-    let i = msgs.length;
-    for (let j = msgs.length; after != null && j > 0; j--) {
-      const p = msgs[j - 1];
-      // «уточню» и напоминания между сообщениями клиента не мешают: ответ встаёт перед первым из новых
-      if (p.seq <= after || (p.role !== "client" && !p.hold && !p.notice)) break;
-      if (p.role === "client") i = j - 1;
-    }
-    msgs.splice(i, 0, { at: this.now(), seq: conv.msgCount, ...m });
+    msgs.splice(replyIndex(msgs, after), 0, { at: this.now(), seq: conv.msgCount, ...m });
     if (msgs.length > 100) msgs.splice(0, msgs.length - 100);
     conv.updatedAt = this.now();
   }
@@ -271,10 +266,17 @@ class App {
     return unansweredTail(conv.messages, conv.session?.startedAt).filter((m) => m.role === "client");
   }
 
-  // Клиенту уже пообещали «уточню и отвечу» на эти вопросы (или бот как раз это печатает) —
-  // второй раз не повторяем
-  holdSent(conv) {
-    return this.holding.has(conv.id) || unansweredTail(conv.messages, conv.session?.startedAt).some((m) => m.hold);
+  // Можно ли сейчас написать клиенту «уточню» с таким текстом. Одного обещания на вопрос хватает: пока оно
+  // уходит или клиент после него ничего не дописал, второе не шлём. Клиент дописал — стандартную фразу
+  // всё равно не повторяем, а свои слова ИИ (own) отправляем: в них бывает ответ на часть нового.
+  mayHold(conv, text, own = false) {
+    if (!text || this.holding.has(conv.id)) return false;
+    const tail = unansweredTail(conv.messages, conv.session?.startedAt);
+    const last = tail.findLastIndex((m) => m.hold);
+    if (last < 0) return true;
+    if (!own || !tail.slice(last + 1).some((m) => m.role === "client")) return false;
+    const said = tail.filter((m) => m.hold).map((m) => m.text);
+    return !splitReply(text).every((part) => said.includes(part)); // слово в слово то же самое не повторяем
   }
 
   // Клиент написал что-то новое текстом после сообщения номер seq. Голосовое или фото ответ
@@ -361,14 +363,21 @@ class App {
       // и решит, как поступил бы человек: отправить и дописать про новое или ответить заново.
       let draft = null;
       // Следующий круг нового ответа не дал (сбой ИИ, лимит, вложение) — отправляем начатый как есть:
-      // на то, что клиент спросил раньше, он отвечал верно. false — дальше этот круг не идёт.
+      // на то, что клиент спросил раньше, он отвечал верно. false — диалог уже взял мастер, дальше не идём.
+      // Что не ушло из-за сбоя отправки, остаётся в lost.
+      let lost = "";
       const flush = async (conv) => {
-        if (!draft) return true;
-        const { text, after } = draft;
-        draft = null;
-        const out = await this.deliver(conv, text, "bot", { after });
-        return !out.failed && conv.status === "bot";
+        if (draft) {
+          const { text, after } = draft;
+          draft = null;
+          const out = await this.deliver(conv, text, "bot", { after });
+          if (out.failed) lost = out.unsent;
+        }
+        return conv.status === "bot";
       };
+      // Сбой отправки передачу мастеру не отменяет: вопрос клиента не должен пропасть. Клиенту тогда больше
+      // не пишем (о сбое мастера уже знают), а то, что не ушло, мастер получит черновиком.
+      const toMaster = (conv, h) => this.handoff(conv, lost ? { ...h, draft: h.draft || lost, hold: "" } : h);
       for (let round = 0; round < 4; round++) {
         const conv = this.conv(id);
         if (!conv || conv.status !== "bot") return;
@@ -378,7 +387,7 @@ class App {
         const odd = pending.find((m) => m.needsHuman);
         if (odd) {
           if (!(await flush(conv))) return;
-          await this.handoff(conv, { reason: `клиент прислал ${odd.needsHuman} — бот такое не разбирает`, hold: MEDIA_HOLD[odd.needsHuman] || "" });
+          await toMaster(conv, { reason: `клиент прислал ${odd.needsHuman} — бот такое не разбирает`, hold: MEDIA_HOLD[odd.needsHuman] || "" });
           return;
         }
 
@@ -386,7 +395,7 @@ class App {
         conv.llmCalls = (conv.llmCalls || []).filter((t) => this.now() - t < HOUR);
         if (conv.llmCalls.length >= this.cfg.llmCallsPerHour) {
           if (!(await flush(conv))) return;
-          await this.handoff(conv, { reason: "клиент пишет слишком часто — бот взял паузу" });
+          await toMaster(conv, { reason: "клиент пишет слишком часто — бот взял паузу" });
           return;
         }
         conv.llmCalls.push(this.now());
@@ -411,30 +420,39 @@ class App {
         if (result.kind === "error") {
           // При сбое ИИ молчим: неизвестно, что именно клиент спросил и нужно ли ему что-то обещать
           if (!(await flush(conv))) return;
-          await this.handoff(conv, { reason: result.reason, error: true });
+          await toMaster(conv, { reason: result.reason, error: true });
           return;
         }
         if (result.kind === "handoff") {
           // ИИ сам написал «уточню»: неотправленный ответ он видел и что в нём ещё верно, перенёс туда.
-          // Иначе (не уверен, отказался, «уточню» на этот вопрос уже уходило) начатый ответ уходит как есть.
-          const ownHold = Boolean(result.hold) && !this.holdSent(conv);
-          const flushed = !ownHold && draft ? draft.text : "";
+          // Иначе (не уверен, отказался, «уточню» уже ушло, а клиент после него не писал) начатый ответ
+          // уходит как есть.
+          const ownHold = this.mayHold(conv, result.hold, true);
+          const started = !ownHold && draft ? draft.text : "";
           if (!ownHold && !(await flush(conv))) return;
           // Черновик для мастера — только про новое: то, что уже ушло клиенту, второй раз не отправляем
           let cardDraft = result.draft || "";
-          if (flushed && cardDraft.startsWith(flushed)) cardDraft = cardDraft.slice(flushed.length).trim();
-          await this.handoff(conv, {
+          if (started && !lost && cardDraft.startsWith(started)) cardDraft = cardDraft.slice(started.length).trim();
+          await toMaster(conv, {
             reason: result.reason,
             draft: cardDraft,
             confidence: result.confidence,
             // ИИ не знает ответа — клиенту «уточню и скоро отвечу» (своими словами или стандартной фразой).
             // Нет hold — ИИ отказался отвечать или ничего не написал: тогда молчим.
             hold: result.hold == null ? "" : ownHold ? result.hold : HOLD_TEXT,
+            own: ownHold,
           });
           return;
         }
         const out = await this.deliver(conv, result.text, "bot", { after: seen, stopIf: outdated });
-        if (out.failed) return; // мастерам уже написали; не крутим ИИ впустую
+        if (out.failed) {
+          // Мастерам о сбое уже написали, ИИ впустую не крутим. Но фото или голосовое, которые клиент прислал
+          // тем временем, разберёт только мастер: следующий круг передаст их ему вместе с тем, что не ушло.
+          lost = out.unsent;
+          draft = null;
+          if (!this.pendingClientMessages(conv).some((m) => m.needsHuman)) return;
+          continue;
+        }
         draft = out.unsent ? { text: out.unsent, after: seen } : null;
         // следующий круг ответит на то, что клиент написал, пока бот думал или «печатал»
       }
@@ -506,9 +524,10 @@ class App {
   // даже если диалог ведёт мастер. Ни то ни другое не ответ по существу, поэтому сообщения клиента
   // бот прочитанными не отмечает (это сделает тот, кто ответит).
   // stopIf — бросить устаревший ответ, если клиент дописал: вернёт неотправленный остаток в unsent.
-  // Сбой отправки — { failed: true }, мастерам уже написали. Мастер перехватил диалог, пока бот
-  // «печатал», — { stopped: true, sent: сколько частей успело уйти }.
-  async deliver(conv, text, role = "bot", { after = conv.msgCount, hold = false, notice = false, stopIf = null } = {}) {
+  // Сбой отправки — { failed: true, unsent: что не ушло, error }, мастерам уже написали (кроме мастера
+  // by: он сам нажал кнопку, и ему ответит вызвавший). Мастер перехватил диалог, пока бот «печатал», —
+  // { stopped: true, sent: сколько частей успело уйти }.
+  async deliver(conv, text, role = "bot", { after = conv.msgCount, hold = false, notice = false, stopIf = null, by } = {}) {
     const parts = splitReply(text);
     if (!parts.length) return {};
     if (!hold && !notice) await this.markRead(conv, after);
@@ -535,9 +554,11 @@ class App {
         this.save();
         await this.notifyAdmins(
           `⚠️ Не удалось отправить сообщение клиенту <b>${esc(conv.client.name)}</b>: ${esc(e.message)}`,
-          [[{ text: "📜 Переписка", callback_data: `c:open:${conv.id}` }]]
+          [[{ text: "📜 Переписка", callback_data: `c:open:${conv.id}` }]],
+          null,
+          { except: by }
         );
-        return { failed: true };
+        return { failed: true, unsent: parts.slice(i).join("\n\n"), error: e.message };
       }
     }
     this.save();
@@ -547,11 +568,11 @@ class App {
   // ---------- передача мастеру ----------
 
   // hold — что сразу написать клиенту («уточню и скоро отвечу»), чтобы он не ждал в тишине.
-  // Пустая строка — бот молчит (например, при сбое ИИ).
-  async handoff(conv, { reason, draft = "", confidence = null, error = false, hold = "" }) {
+  // Пустая строка — бот молчит (например, при сбое ИИ). own — это слова самого ИИ, а не стандартная фраза.
+  async handoff(conv, { reason, draft = "", confidence = null, error = false, hold = "", own = false }) {
     this.cancelScheduled(conv.id);
-    // Одного «уточню» на вопрос хватает: после «Бот, попробуй ещё» второй раз не обещаем
-    const holdText = hold && !this.holdSent(conv) ? hold : "";
+    // Одного «уточню» на вопрос хватает: после «Бот, попробуй ещё» второй раз не обещаем (см. mayHold)
+    const holdText = this.mayHold(conv, hold, own) ? hold : "";
     if (holdText) this.holding.add(conv.id); // сразу: пока это «уточню» не ушло, второе не начинаем
     conv.status = "waiting";
     conv.handoff = {
@@ -649,6 +670,8 @@ class App {
     for (const a of Object.values(this.state.admins)) {
       if (a.relayTo !== conv.id) continue;
       a.relayTo = null;
+      // Диалога больше нет: обычные сообщения идут в открытую настройку, и мастер снова занят ею
+      if (a.mode) a.focus = "setup";
       if (a.id !== by) others.push(a);
     }
     // Для кнопки «Запомнить ответ»: вопрос, на который бот не смог, и ответ мастера
@@ -851,9 +874,10 @@ class App {
     }
   }
 
-  async notifyAdmins(text, keyboard, convId) {
-    const targets = Object.values(this.state.admins).filter((a) => a.notify !== false);
-    for (const a of targets) await this.notifyAdmin(a.id, text, keyboard, convId);
+  async notifyAdmins(text, keyboard, convId, { except } = {}) {
+    const targets = Object.values(this.state.admins).filter((a) => a.notify !== false && Number(a.id) !== Number(except));
+    // text — строка или функция от мастера: у каждого свой адресат обычных сообщений
+    for (const a of targets) await this.notifyAdmin(a.id, typeof text === "function" ? text(a) : text, keyboard, convId);
     this.save();
   }
 
@@ -879,21 +903,30 @@ class App {
     lines.push(`⚠️ ${esc(h.reason)}`);
     if (h.hold) lines.push(`🕐 Клиенту пишу: «${esc(truncate(h.hold, 300))}»`);
     if (h.draft) lines.push(`📝 Черновик бота: «${esc(truncate(h.draft, 700))}»`);
-    if (conv.kind === "business") {
-      lines.push(h.hold ? "<i>Ответить можно прямо в своём Telegram.</i>" : "<i>Сообщение осталось непрочитанным — можно ответить прямо в своём Telegram.</i>");
-    } else lines.push("<i>Ответьте реплаем на это сообщение — я передам клиенту.</i>");
+    // Последняя строка — как ответить. Если обычное сообщение мастера сейчас ушло бы не этому клиенту
+    // (в незакрытую настройку точки или другому клиенту), говорим об этом прямо в карточке
+    const own = h.hold ? "Ответить можно прямо в своём Telegram." : "Сообщение осталось непрочитанным — можно ответить прямо в своём Telegram.";
+    const how = (a) => {
+      const where = this.elsewhereNote(a, conv);
+      if (conv.kind === "business") return `<i>${where ? `${where} ` : ""}${own}</i>`;
+      return `<i>${where ? `${where} ${REPLY_HERE}` : "Ответьте реплаем на это сообщение — я передам клиенту."}</i>`;
+    };
     const kb = [[{ text: "✋ Взять диалог", callback_data: `c:take:${conv.id}` }]];
     if (h.draft) kb[0].push({ text: "✅ Отправить черновик", callback_data: `c:send:${conv.id}` });
     kb.push([
       { text: "🔁 Бот, попробуй ещё", callback_data: `c:retry:${conv.id}` },
       { text: "📜 Переписка", callback_data: `c:open:${conv.id}` },
     ]);
-    await this.notifyAdmins(lines.join("\n"), kb, conv.id);
+    await this.notifyAdmins((a) => [...lines, how(a)].join("\n"), kb, conv.id);
   }
 
   async notifyMoreFromClient(conv, text) {
+    const head = `💬 <b>${esc(conv.client.name)}</b> (ждёт ответа): ${esc(truncate(text, 1000))}`;
     await this.notifyAdmins(
-      `💬 <b>${esc(conv.client.name)}</b> (ждёт ответа): ${esc(truncate(text, 1000))}`,
+      (a) => {
+        const where = this.elsewhereNote(a, conv);
+        return where ? `${head}\n\n<i>${where} ${REPLY_HERE}</i>` : head;
+      },
       [
         [
           { text: "✋ Взять диалог", callback_data: `c:take:${conv.id}` },
@@ -921,9 +954,8 @@ class App {
           lines.push("", "<i>Настройка точки не закончена, но обычные сообщения теперь снова уходят этому клиенту.</i>");
           kb.push([{ text: "✏️ Писать в настройку", callback_data: "s:focus" }]);
         } else {
-          const other = this.conv(this.dialogFocus(a));
-          const where = other ? `уходят клиенту <b>${esc(other.client.name || "Клиент")}</b>` : a?.mode ? "идут в настройку точки" : "";
-          lines.push("", `<i>${where ? `Обычные сообщения сейчас ${where}. ` : ""}Ответьте реплаем на это сообщение или нажмите «Писать сюда».</i>`);
+          const where = this.elsewhereNote(a, conv);
+          lines.push("", `<i>${where ? `${where} ` : ""}Ответьте реплаем на это сообщение или нажмите «Писать сюда».</i>`);
           kb.unshift([{ text: "✍️ Писать сюда", callback_data: `c:write:${conv.id}` }]);
         }
       }
