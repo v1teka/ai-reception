@@ -14,12 +14,31 @@ function listen(handler) {
   });
 }
 
-function readBody(req) {
+function readBody(req, binary = false) {
   return new Promise((resolve) => {
-    let body = "";
-    req.on("data", (c) => (body += c));
-    req.on("end", () => resolve(body));
+    const parts = [];
+    req.on("data", (c) => parts.push(c));
+    req.on("end", () => {
+      const buf = Buffer.concat(parts);
+      resolve(binary ? buf : buf.toString("utf8"));
+    });
   });
+}
+
+// Загрузка файла (multipart/form-data): поля — строками, файлы — { filename, size, data }
+function parseMultipart(buf, type) {
+  const boundary = "--" + type.match(/boundary=(?:"([^"]+)"|([^;]+))/).slice(1).find(Boolean);
+  const out = {};
+  const text = buf.toString("latin1");
+  for (const part of text.split(boundary).slice(1, -1)) {
+    const [head, ...rest] = part.replace(/^\r\n/, "").split("\r\n\r\n");
+    const body = rest.join("\r\n\r\n").replace(/\r\n$/, "");
+    const name = head.match(/name="([^"]+)"/)[1];
+    const filename = head.match(/filename="([^"]*)"/)?.[1];
+    const data = Buffer.from(body, "latin1");
+    out[name] = filename != null ? { filename, size: data.length, data } : data.toString("utf8");
+  }
+  return out;
 }
 
 class FakeTelegram {
@@ -46,8 +65,9 @@ class FakeTelegram {
       return res.end(buf || "");
     }
     const m = req.url.match(/^\/bot([^/]+)\/(\w+)/);
-    const raw = await readBody(req);
-    const params = raw ? JSON.parse(raw) : {};
+    const raw = await readBody(req, true);
+    const type = req.headers["content-type"] || "";
+    const params = type.startsWith("multipart/") ? parseMultipart(raw, type) : raw.length ? JSON.parse(raw.toString("utf8")) : {};
     const token = m[1];
     const method = m[2];
     this.calls.push({ token, method, params, at: Date.now() });
@@ -63,6 +83,13 @@ class FakeTelegram {
         break;
       case "sendMessage":
       case "copyMessage":
+      case "sendPhoto":
+      case "sendVoice":
+      case "sendVideo":
+      case "sendVideoNote":
+      case "sendAudio":
+      case "sendAnimation":
+      case "sendDocument":
         result = { message_id: ++this.msgId, chat: { id: params.chat_id }, date: 0, text: params.text };
         break;
       case "editMessageText":

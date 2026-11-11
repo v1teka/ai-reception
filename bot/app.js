@@ -3,13 +3,15 @@
 const { generateReply, unansweredTail, replyIndex } = require("./assistant");
 const { typingDuration, splitReply } = require("./typing");
 const { upcomingBookings, bookingLabel, minutesUntilStart } = require("./schedule");
-const { nowParts } = require("./time");
+const { nowParts, fmtTime } = require("./time");
 const { esc, truncate, oneLine, sleep: realSleep, randomCode, userName } = require("./util");
 
 const HOUR = 3600000;
 
 // Что написать клиенту, когда бот зовёт мастера, а ИИ сам фразу не предложил
 const HOLD_TEXT = "Уточню и скоро вам отвечу";
+// То же, когда прежний вопрос ещё ждёт мастера, а уточнить нужно и новое
+const HOLD_MORE = "Это тоже уточню и скоро отвечу";
 // Мастеру, чьи обычные сообщения сейчас ушли бы не этому клиенту (см. elsewhereNote)
 const REPLY_HERE = "Чтобы ответить этому клиенту, ответьте реплаем на это сообщение или нажмите «Взять диалог».";
 
@@ -26,6 +28,21 @@ const MEDIA = [
   ["document", "файл", "Посмотрю и скоро отвечу"],
 ];
 const MEDIA_HOLD = Object.fromEntries(MEDIA.map(([, label, hold]) => [label, hold]));
+// Как показать вложение мастеру: метод Bot API, его поле, расширение файла (если его надо загрузить заново)
+// и как назвать в подписи. У видеосообщения подписи не бывает.
+const SEND_MEDIA = {
+  photo: ["sendPhoto", "photo", "jpg", "Фото"],
+  voice: ["sendVoice", "voice", "ogg", "Голосовое"],
+  video_note: ["sendVideoNote", "video_note", "mp4", "Видеосообщение"],
+  video: ["sendVideo", "video", "mp4", "Видео"],
+  audio: ["sendAudio", "audio", "mp3", "Аудио"],
+  animation: ["sendAnimation", "animation", "mp4", "Гифка"],
+  document: ["sendDocument", "document", "bin", "Файл"],
+};
+
+// Реакция Telegram (ReactionType) — как её показать
+const reactionLabel = (r) => (r?.type === "emoji" ? r.emoji : r?.type === "paid" ? "⭐" : "свой смайлик");
+const sameReaction = (a, b) => a.type === b.type && a.emoji === b.emoji && a.custom_emoji_id === b.custom_emoji_id;
 
 // Черновик без начатого ответа в начале: начатое клиент получает отдельным сообщением, второй раз не повторяем
 const withoutStart = (text, start) => (start && text.startsWith(start) ? text.slice(start.length).trim() : text);
@@ -44,7 +61,9 @@ class App {
     this.fetchImpl = fetchImpl;
     this.timers = new Map(); // id разговора -> таймер «дождаться, пока клиент допишет»
     this.busy = new Set(); // разговоры, по которым сейчас думает ИИ
+    this.rerun = new Set(); // разговоры, где клиент написал, пока проход заканчивался: после него — ещё проход
     this.holding = new Set(); // разговоры, где бот сейчас «печатает» «уточню и скоро отвечу»
+    this.holdTasks = new Map(); // id разговора -> отправка «уточню»: следующий ответ бота ждёт, пока она закончится
     this.setupBuffers = new Map(); // id мастера -> накопленный ввод для настройки
     this.tasks = new Set();
     this.keyIndex = new Map();
@@ -53,7 +72,21 @@ class App {
       // Переписка из версии, где сообщения ещё не нумеровались: всё, что в ней есть, было «до» любого нового
       // сообщения. Без номера «последнее, что видел бот» (seen, after, upTo) ни с чем не сравнить.
       if (!c.msgCount) c.msgCount = c.messages?.length || 0;
+      this.normalizeLegacyHandoff(c);
     }
+  }
+
+  // Переписка ждёт мастера (или он взял её по карточке) с версии, где карточка не помнила, какие сообщения
+  // клиента в ней (upTo) и откуда начинается вопрос (from). Тогда мастеру показывали всё, что клиент писал,
+  // поэтому всё до этой минуты — за мастером, а вопрос начинается после последнего ответа клиенту.
+  normalizeLegacyHandoff(c) {
+    const h = c.status === "waiting" ? c.handoff : c.status === "admin" ? c.takenHandoff : null;
+    const lastAnswer = (upTo) => c.messages?.filter((m) => m.role !== "client" && !m.hold && !m.notice && (m.seq ?? 0) <= upTo).at(-1)?.seq ?? 0;
+    if (h) {
+      h.upTo ??= c.msgCount;
+      h.from ??= lastAnswer(h.upTo);
+    }
+    if (c.status === "admin" && c.takenAt == null) c.takenAt = h?.from ?? lastAnswer(c.msgCount);
   }
 
   get state() {
@@ -92,9 +125,10 @@ class App {
     let n = 0;
     for (const c of Object.values(this.state.conversations)) {
       // Завершённый диалог не поднимаем: следующий вопрос клиента начнёт новый разговор
-      if (c.status !== "bot" || c.session?.closed || now - (c.lastClientAt || 0) > maxAgeMs) continue;
-      // Без ответа — сообщение клиента или то, что бот не дослал, а мастер вернул ему (см. returnToBot)
-      if (!c.unsent && !this.pendingClientMessages(c).length) continue;
+      if (!this.botLeads(c) || c.session?.closed || now - (c.lastClientAt || 0) > maxAgeMs) continue;
+      // Без ответа — сообщение клиента, то, что бот не дослал, или переписка, которую мастер вернул боту
+      // и которую бот ещё не перечитал (см. returnToBot)
+      if (!c.unsent && !c.recheck && !this.pendingClientMessages(c).length) continue;
       this.schedule(c.id);
       n++;
     }
@@ -179,6 +213,7 @@ class App {
     if (u.business_message) return this.onBusinessMessage(u.business_message);
     if (u.callback_query) return this.onCallback(u.callback_query, source);
     if (u.message) return this.onMessage(u.message, source);
+    if (u.message_reaction) return this.onReaction(u.message_reaction, source);
   }
 
   apiFor(source) {
@@ -269,10 +304,20 @@ class App {
     conv.updatedAt = this.now();
   }
 
-  // Сообщения клиента без ответа в текущем разговоре. «Уточню и скоро отвечу» и напоминания
-  // ответом не считаются: вопрос по-прежнему ждёт мастера или новой попытки бота.
+  // Диалог ведёт бот: сам или пока вопрос ждёт мастера (тогда бот отвечает на всё, что клиент пишет после
+  // этого вопроса). Молчит бот, только когда диалог взял мастер.
+  botLeads(conv) {
+    return conv.status === "bot" || conv.status === "waiting";
+  }
+
+  // Сообщения клиента, на которые бот сейчас должен ответить. «Уточню и скоро отвечу» и напоминания
+  // ответом не считаются. Пока вопрос ждёт мастера, сам этот вопрос (сообщения до handoff.upTo) — за мастером.
+  // Реакцию, на которую ИИ решил не отвечать (quiet), второй раз не разбираем.
   pendingClientMessages(conv) {
-    return unansweredTail(conv.messages, conv.session?.startedAt).filter((m) => m.role === "client");
+    const upTo = conv.status === "waiting" ? conv.handoff?.upTo : null;
+    return unansweredTail(conv.messages, conv.session?.startedAt).filter(
+      (m) => m.role === "client" && !m.quiet && (upTo == null || (m.seq ?? 0) > upTo)
+    );
   }
 
   // Можно ли сейчас написать клиенту «уточню» с таким текстом. Одного обещания на вопрос хватает: пока оно
@@ -289,14 +334,28 @@ class App {
   }
 
   // Клиент написал что-то новое текстом после сообщения номер seq. Голосовое или фото ответ
-  // на прежний вопрос не меняют — их потом разберёт мастер.
+  // на прежний вопрос не меняют — их потом разберёт мастер. Реакция тоже: её бот разберёт следующим кругом.
   wroteSince(conv, seq) {
-    return conv.messages.some((m) => m.role === "client" && !m.service && !m.needsHuman && m.seq > seq);
+    return conv.messages.some((m) => m.role === "client" && !m.service && !m.needsHuman && !m.reaction && m.seq > seq);
   }
 
   // Мастер написал клиенту после сообщения номер seq: ответил сам или, например, отменил его запись из панели
   masterWroteSince(conv, seq) {
     return conv.messages.some((m) => m.role === "admin" && m.seq > seq);
+  }
+
+  // Сообщения клиента в текущем разговоре после сообщения номер seq (реакции-эмоции, на которые бот решил
+  // не отвечать, не считаем)
+  clientMessagesSince(conv, seq) {
+    const since = conv.session?.startedAt || 0;
+    return conv.messages.filter((m) => m.role === "client" && !m.service && !m.quiet && m.at >= since && (m.seq ?? 0) > seq);
+  }
+
+  // На сообщение клиента бот ответил сам: следом за ним в переписке — ответ бота, а не «уточню» и не напоминание
+  botAnswered(conv, m) {
+    const i = conv.messages.indexOf(m);
+    const next = i < 0 ? null : conv.messages.slice(i + 1).find((x) => x.role !== "client");
+    return next?.role === "bot" && !next.hold && !next.notice;
   }
 
   isOwnChat(conv, adminId) {
@@ -311,9 +370,20 @@ class App {
     if (msg.sticker) return { text: `[стикер ${msg.sticker.emoji || ""}]`.replace(" ]", "]") };
     if (msg.location) return { text: "[отправил геолокацию]" };
     for (const [field, label] of MEDIA) {
-      if (msg[field]) return { text: `[${label}]${caption}`, needsHuman: label };
+      if (msg[field]) return { text: `[${label}]${caption}`, needsHuman: label, media: this.mediaOf(msg) };
     }
     return { text: "[сообщение]", needsHuman: "сообщение без текста" };
+  }
+
+  // Вложение, которое мастер сможет посмотреть из панели: какое и его file_id (у фото — самый крупный размер)
+  mediaOf(msg) {
+    for (const [field] of MEDIA) {
+      const v = msg[field];
+      if (!v) continue;
+      const file = Array.isArray(v) ? v[v.length - 1] : v;
+      if (file?.file_id) return { kind: field, fileId: file.file_id, name: file.file_name || "" };
+    }
+    return null;
   }
 
   // ---------- клиент пишет ----------
@@ -328,20 +398,56 @@ class App {
     if (transport.kind === "direct" && /^\/start(\s|$)/.test(msg.text || "")) {
       this.pushMessage(conv, { role: "client", text: "/start", mid: msg.message_id, service: true });
       this.save();
-      if (conv.status === "bot") this.run(() => this.deliver(conv, this.greeting(), "bot"));
+      if (this.botLeads(conv)) this.run(() => this.deliver(conv, this.greeting(), "bot"));
       return;
     }
 
     const content = this.messageContent(msg);
     if (content.phone) conv.phone = content.phone;
-    this.pushMessage(conv, { role: "client", text: content.text, mid: msg.message_id, needsHuman: content.needsHuman || null });
+    this.pushMessage(conv, { role: "client", text: content.text, mid: msg.message_id, needsHuman: content.needsHuman || null, ...(content.media ? { media: content.media } : {}) });
     conv.lastClientAt = now;
     if (transport.kind === "business") conv.unread.push(msg.message_id);
     this.save();
 
-    if (conv.status === "admin") return this.run(() => this.forwardToHandler(conv, content.text));
-    if (conv.status === "waiting") return this.run(() => this.notifyMoreFromClient(conv, content.text));
+    if (conv.status === "admin") return this.run(() => this.forwardToHandler(conv, content.text, conv.messages.at(-1)));
+    // Бот ведёт диалог, даже если прежний вопрос ждёт мастера: на новое он отвечает сам (см. pendingClientMessages)
     this.schedule(conv.id);
+  }
+
+  // Реакция клиента на сообщение. Бывает ответом («👍» на «Записать вас на 15:00?»), поэтому бот видит её как
+  // сообщение клиента, а мастер — в переписке и сразу, если ведёт диалог. Telegram присылает реакции только
+  // в чате с самим ботом: в чатах Telegram Business их видно только в Telegram мастера.
+  async onReaction(r, source) {
+    if (source === "console" || r.chat?.type !== "private" || !r.user || r.user.is_bot) return;
+    const conv = this.convByKey(`d:${r.chat.id}`);
+    if (!conv) return;
+    const added = (r.new_reaction || []).filter((n) => !(r.old_reaction || []).some((o) => sameReaction(o, n)));
+    if (!added.length) return; // реакцию убрали — ответом это не бывает
+    const target = conv.messages.find((m) => m.mid === r.message_id && !m.service);
+    // Мастер отметил сообщение панели в своём же чате с ботом — к его проверке «как клиент» это не относится
+    if (!target && this.role(r.user.id)) return;
+    const reaction = { emoji: added.map(reactionLabel).join(""), to: r.message_id, on: target?.role || null, quote: target ? truncate(oneLine(target.text), 80) : "" };
+    // ИИ видит реакцию с его точки зрения: «на ваше сообщение» — на сообщение бота
+    const whose = { client: " на своё сообщение", admin: " на сообщение мастера", bot: " на ваше сообщение" }[reaction.on] || "";
+    const text = `[реакция ${reaction.emoji}${whose}${reaction.quote ? ` «${reaction.quote}»` : ""}]`;
+    // Завершённый разговор реакция не открывает заново: в истории она есть, отвечать на неё некому
+    const closed = Boolean(conv.session?.closed);
+    this.pushMessage(conv, { role: "client", text, mid: null, reaction, ...(closed ? { quiet: true } : {}) });
+    if (!closed) conv.lastClientAt = this.now();
+    this.save();
+    const m = conv.messages.at(-1);
+    // Диалог ведёт мастер — реакция приходит ему, даже если разговор до этого завершили: он мог сам спросить клиента
+    if (conv.status === "admin") return this.run(() => this.forwardToHandler(conv, this.panelText(m), m));
+    if (closed) return;
+    this.schedule(conv.id);
+  }
+
+  // Сообщение клиента для панели мастера: реакцию — словами для мастера, а не так, как её видит ИИ
+  panelText(m) {
+    if (!m.reaction) return m.text;
+    const { emoji, on, quote } = m.reaction;
+    const whose = { client: "своё сообщение", admin: "сообщение мастера", bot: "сообщение бота" }[on] || "сообщение";
+    return `${emoji} на ${whose}${quote ? ` «${quote}»` : ""}`;
   }
 
   greeting() {
@@ -369,16 +475,23 @@ class App {
   }
 
   async processConv(id) {
-    if (this.busy.has(id)) return; // текущий проход сам подхватит новые сообщения
+    // Текущий проход подхватит новые сообщения сам, а если он уже позвал мастера и заканчивается — запустит ещё один
+    if (this.busy.has(id)) return void this.rerun.add(id);
+    this.rerun.delete(id);
     this.busy.add(id);
     let again = false;
     try {
+      // Бот ещё «печатает» «уточню» по прежнему вопросу — ответ на новое уйдёт после него, а не вперемешку
+      await this.holdTasks.get(id);
       // Ответ, который бот не отправил, потому что клиент дописал. ИИ увидит его в следующем круге
       // и решит, как поступил бы человек: отправить и дописать про новое или ответить заново.
       // С него же начинается проход, если мастер вернул боту диалог с тем, что не ушло из-за сбоя (conv.unsent).
       const resumed = this.conv(id);
       let draft = resumed?.unsent || null;
-      if (resumed) resumed.unsent = null;
+      // Мастер вернул диалог боту (см. returnToBot): если в конце переписки нет сообщения клиента без ответа,
+      // ИИ перечитает её с того места, где звали мастера, — мастер мог ответить не на всё
+      let recheck = resumed?.recheck || null;
+      if (resumed) [resumed.unsent, resumed.recheck] = [null, null];
       // Следующий круг нового ответа не дал (сбой ИИ, лимит, вложение) — отправляем начатый как есть:
       // на то, что клиент спросил раньше, он отвечал верно. false — диалог уже взял мастер, дальше не идём.
       // Что не ушло из-за сбоя отправки, остаётся в lost; lostAfter — на какие сообщения клиента оно отвечало.
@@ -394,7 +507,7 @@ class App {
           if (out.failed) [lost, lostAfter, lostError] = [out.unsent, started.after, out.error];
           else if (out.unsent) draft = { ...started, text: out.unsent };
         }
-        return conv.status === "bot";
+        return this.botLeads(conv);
       };
       // Сбой отправки передачу мастеру не отменяет: вопрос клиента не должен пропасть. Клиенту тогда больше
       // не пишем (о сбое мастера уже знают), а то, что не ушло, мастер получит в начале черновика. Если кроме
@@ -406,10 +519,17 @@ class App {
         const full = [lost, h.draft].filter(Boolean).join("\n\n");
         return this.handoff(conv, { ...h, draft: full, hold: "", draftAfter: h.draft ? null : lostAfter, lost: { text: lost, after: lostAfter } });
       };
-      const sendFailed = (conv, question) => toMaster(conv, { reason: `не удалось отправить ответ клиенту: ${lostError}`, question });
+      const sendFailed = (conv, question) => toMaster(conv, { reason: `не удалось отправить ответ клиенту: ${lostError}`, question, sendFailed: true });
       for (let round = 0; round < 4; round++) {
         const conv = this.conv(id);
-        if (!conv || conv.status !== "bot") return;
+        if (!conv || !this.botLeads(conv)) return;
+        // Мастера звали только потому, что готовый ответ не ушёл (сбой Telegram), а клиент снова пишет: бот забирает
+        // диалог обратно, как по «Бот, попробуй ещё», — недосланное уйдёт или ИИ решит, что из него ещё верно
+        if (conv.status === "waiting" && conv.handoff?.sendFailed && this.pendingClientMessages(conv).length) {
+          await this.returnToBot(conv, { resume: true });
+          [draft, recheck] = [conv.unsent || draft, conv.recheck || recheck];
+          [conv.unsent, conv.recheck] = [null, null];
+        }
         // Мастер вернул боту то, что не ушло из-за сбоя, а клиент с тех пор ничего не написал: ответ по-прежнему
         // верен и уходит как есть, ИИ заново не зовём. (Обычный начатый ответ сюда не попадает: он появляется,
         // только когда клиент дописал.) Написал — ниже ИИ увидит этот ответ как неотправленный и решит сам. То же,
@@ -417,19 +537,34 @@ class App {
         if (draft && !this.wroteSince(conv, draft.after)) {
           const { question = "", upTo = 0, after } = draft;
           if (!(await flush(conv, () => this.wroteSince(conv, after)))) return;
+          if (!lost) recheck = null; // недосланное ушло: на то, о чём звали мастера, ответ есть
           if (!lost) continue; // дальше — то, что клиент прислал после (фото, голосовое) или дописал сейчас
           // Снова не ушло: диалог опять ждёт мастера. В вопросе — прежний вопрос и то, что клиент прислал после него
-          const more = this.pendingClientMessages(conv).filter((m) => m.seq > upTo).map((m) => m.text);
+          const more = this.pendingClientMessages(conv).filter((m) => m.seq > upTo).map((m) => this.panelText(m));
           await sendFailed(conv, [question, ...more].filter(Boolean).join("\n"));
           return;
         }
         const pending = this.pendingClientMessages(conv);
-        if (!pending.length) return;
+        // Перечитать после возврата: о чём клиент писал с тех пор, как звали мастера (или мастер взял диалог).
+        // Реакция в конце (👍 на ответ мастера) перечитывать не мешает: она бывает и просто «спасибо».
+        const onlyReactions = pending.length > 0 && pending.every((m) => m.reaction);
+        const asked = recheck && (!pending.length || onlyReactions) ? this.clientMessagesSince(conv, recheck.since) : [];
+        // Позовёт мастера снова — вопрос в карточке то, о чём клиент писал с тех пор (кроме того, на что бот уже
+        // ответил сам), и перечитывать потом отсюда же. «Уточню» с тех пор клиенту уже писали — второй раз не обещаем.
+        const open = asked.filter((m) => !this.botAnswered(conv, m));
+        const re = asked.length ? { question: (open.length ? open : asked).map((m) => this.panelText(m)).join("\n"), from: recheck.since } : {};
+        const promised = asked.length > 0 && conv.messages.some((m) => m.hold && (m.seq ?? 0) > recheck.since);
+        recheck = null;
+        if (!pending.length && !asked.length) return;
 
         const odd = pending.find((m) => m.needsHuman);
         if (odd) {
           if (!(await flush(conv))) return;
+          // Вложения — те же, что войдут в карточку: пока бот дописывал начатое, клиент мог прислать ещё
+          const media = this.pendingClientMessages(conv).filter((m) => m.media);
           await toMaster(conv, { reason: `клиент прислал ${odd.needsHuman} — бот такое не разбирает`, hold: MEDIA_HOLD[odd.needsHuman] || "" });
+          // Само вложение — следом за карточкой: в обычном чате с ботом мастер иначе его не увидит
+          for (const m of media) await this.showMediaToAdmins(conv, m);
           return;
         }
 
@@ -437,16 +572,18 @@ class App {
         conv.llmCalls = (conv.llmCalls || []).filter((t) => this.now() - t < HOUR);
         if (conv.llmCalls.length >= this.cfg.llmCallsPerHour) {
           if (!(await flush(conv))) return;
-          await toMaster(conv, { reason: "клиент пишет слишком часто — бот взял паузу" });
+          await toMaster(conv, { reason: "клиент пишет слишком часто — бот взял паузу", ...re });
           return;
         }
         conv.llmCalls.push(this.now());
 
         const seen = conv.msgCount;
-        const result = await generateReply({ llm: this.llm, cfg: this.cfg, state: this.state, shop: this.shop, conv, draft, now: this.now(), log: this.log });
+        // Отвечать не обязательно, если бот перечитывает переписку после мастера или клиент только поставил реакцию
+        const silentOk = Boolean(asked.length) || pending.every((m) => m.reaction);
+        const result = await generateReply({ llm: this.llm, cfg: this.cfg, state: this.state, shop: this.shop, conv, draft, recheck: Boolean(asked.length), silentOk, now: this.now(), log: this.log });
         for (const ef of result.effects) await this.onEffect(conv, ef);
         this.save();
-        if (conv.status !== "bot") return; // мастер перехватил, пока ИИ думал
+        if (!this.botLeads(conv)) return; // мастер перехватил, пока ИИ думал
 
         // Клиент дописал, пока ИИ думал или бот «печатал», — ответ мог устареть: не отправляем его,
         // а переписываем с учётом нового. Если ИИ уже записал или отменил запись, ответ о сделанном
@@ -459,28 +596,37 @@ class App {
           continue;
         }
 
+        if (result.kind === "silent") {
+          // ИИ решил, что отвечать не на что: реакция-эмоция или мастер уже ответил на всё. Начатое уходит как есть.
+          for (const m of pending) if (m.reaction) m.quiet = true;
+          this.save();
+          if (!(await flush(conv))) return;
+          continue;
+        }
+
         if (result.kind === "error") {
           // При сбое ИИ молчим: неизвестно, что именно клиент спросил и нужно ли ему что-то обещать
           if (!(await flush(conv))) return;
-          await toMaster(conv, { reason: result.reason, error: true });
+          await toMaster(conv, { reason: result.reason, error: true, ...re });
           return;
         }
         if (result.kind === "handoff") {
           // ИИ сам написал «уточню»: неотправленный ответ он видел и что в нём ещё верно, перенёс туда.
           // Иначе (не уверен, отказался, «уточню» уже ушло, а клиент после него не писал) начатый ответ
           // уходит как есть.
-          const ownHold = this.mayHold(conv, result.hold, true);
+          const ownHold = !promised && this.mayHold(conv, result.hold, true);
           const started = !ownHold && draft ? draft.text : "";
           if (!ownHold && !(await flush(conv))) return;
           // Черновик для мастера — только про новое: начатое уже ушло клиенту, а что из него не ушло из-за
           // сбоя, встанет в начало черновика само (toMaster) — второй раз не повторяем
           await toMaster(conv, {
             reason: result.reason,
+            ...re,
             draft: withoutStart(result.draft || "", started),
             confidence: result.confidence,
             // ИИ не знает ответа — клиенту «уточню и скоро отвечу» (своими словами или стандартной фразой).
             // Нет hold — ИИ отказался отвечать или ничего не написал: тогда молчим.
-            hold: result.hold == null ? "" : ownHold ? result.hold : HOLD_TEXT,
+            hold: result.hold == null || promised ? "" : ownHold ? result.hold : HOLD_TEXT,
             own: ownHold,
             carried: ownHold ? draft : null, // не уйдёт «уточню» — начатое вернётся мастеру в черновик (см. handoff)
           });
@@ -494,8 +640,8 @@ class App {
           [lost, lostAfter, lostError] = [out.unsent, seen, out.error];
           // Вопрос в карточке — то, на что этот ответ отвечал, и то, что клиент дописал после. Если первая часть
           // ответа ушла, эти сообщения уже считаются отвеченными, и сама карточка их бы не показала.
-          const asked = [...new Set([...pending, ...this.pendingClientMessages(conv)])].map((m) => m.text).join("\n");
-          if (conv.status === "bot") await sendFailed(conv, asked);
+          const question = [...new Set([...pending, ...asked, ...this.pendingClientMessages(conv)])].map((m) => this.panelText(m)).join("\n");
+          if (this.botLeads(conv)) await sendFailed(conv, question);
           return;
         }
         draft = out.unsent ? { text: out.unsent, after: seen } : null;
@@ -504,7 +650,7 @@ class App {
       again = true;
     } finally {
       this.busy.delete(id);
-      if (again) this.schedule(id);
+      if (again || this.rerun.delete(id)) this.schedule(id);
     }
   }
 
@@ -576,8 +722,8 @@ class App {
     const parts = splitReply(text);
     if (!parts.length) return {};
     if (!hold && !notice) await this.markRead(conv, after);
-    // Бот пишет, только пока диалог у него (а «уточню» — пока диалог ждёт мастера)
-    const mayGo = () => notice || role !== "bot" || conv.status === (hold ? "waiting" : "bot");
+    // Бот пишет, только пока диалог у него (а «уточню» — пока вопрос ждёт мастера)
+    const mayGo = () => notice || role !== "bot" || (hold ? conv.status === "waiting" : this.botLeads(conv));
     const flags = hold ? { hold: true } : notice ? { notice: true } : {};
     for (let i = 0; i < parts.length; i++) {
       if (i > 0) await this.sleep(this.cfg.typing.pauseMs);
@@ -619,34 +765,52 @@ class App {
   // carried — начатый ответ { text, after }, который бот отдельно не отправлял: ИИ перенёс его в своё «уточню».
   // question — вопрос для карточки, если это не просто всё, что сейчас без ответа.
   // lost — та часть черновика { text, after }, которую бот уже отправлял клиенту и не смог (см. returnToBot).
-  async handoff(conv, { reason, draft = "", confidence = null, error = false, hold = "", own = false, draftAfter = null, carried = null, question = null, lost = null }) {
+  // Вопрос уже ждёт мастера, а бот позвал его ещё раз (на новое тоже нужен мастер): карточка одна на оба вопроса —
+  // вопрос, черновик и недосланное прежней карточки остаются, к ним добавляется новое.
+  async handoff(conv, { reason, draft = "", confidence = null, error = false, hold = "", own = false, draftAfter = null, carried = null, question = null, lost = null, from = null, sendFailed = false }) {
     this.cancelScheduled(conv.id);
-    // Одного «уточню» на вопрос хватает: после «Бот, попробуй ещё» второй раз не обещаем (см. mayHold)
-    const holdText = this.mayHold(conv, hold, own) ? hold : "";
+    const prev = conv.status === "waiting" ? conv.handoff : null;
+    const pending = this.pendingClientMessages(conv); // пока вопрос ждёт мастера — только то, что клиент написал после него
+    const asked = question ?? pending.map((m) => this.panelText(m)).join("\n");
+    // Одного «уточню» на вопрос хватает: после «Бот, попробуй ещё» второй раз не обещаем (см. mayHold).
+    // Ещё один вопрос к мастеру, пока прежний ждёт его, — стандартная фраза другая («это тоже уточню»): клиент
+    // написал новое, и обещание касается его. Слово в слово то же самое бот не повторяет. «Тоже» — только если
+    // про прежний вопрос клиенту что-то обещали (при сбое ИИ бот молчал).
+    const told = prev && conv.messages.some((m) => m.hold && (m.seq ?? 0) > (prev.from ?? -1));
+    const more = told && hold === HOLD_TEXT;
+    const holdText = this.mayHold(conv, more ? HOLD_MORE : hold, own || more) ? (more ? HOLD_MORE : hold) : "";
     if (holdText) this.holding.add(conv.id); // сразу: пока это «уточню» не ушло, второе не начинаем
     conv.status = "waiting";
+    // Черновик прежней карточки отвечал только на её вопрос: если нового черновика нет, после отправки
+    // бот разберёт то, что клиент написал позже (draftAfter)
+    const after = !prev || draft ? draftAfter : prev.draft ? (prev.draftAfter ?? prev.upTo) : null;
+    // А если черновик есть только у нового вопроса, прежний он не закрывает: после «Отправить черновик» прежний
+    // вопрос снова ждёт мастера (open — его карточка без черновика)
+    const open = !prev ? null : prev.open ?? (!prev.draft && draft ? { reason: prev.reason, question: prev.question, at: prev.at, upTo: prev.upTo, from: prev.from, hold: prev.hold } : null);
     const h = (conv.handoff = {
       reason,
-      draft,
-      draftAfter,
-      lost,
+      draft: [prev?.draft, draft].filter(Boolean).join("\n\n"),
+      draftAfter: after,
+      lost: lost ?? prev?.lost ?? null,
       confidence,
       error,
       hold: holdText,
-      at: this.now(),
+      at: prev?.at ?? this.now(),
       upTo: conv.msgCount, // вопрос ниже охватывает сообщения клиента до этого номера
-      question:
-        question ??
-        this.pendingClientMessages(conv)
-          .map((m) => m.text)
-          .join("\n"),
+      // С какого сообщения начинается вопрос: отсюда бот перечитает переписку, когда мастер вернёт её (returnToBot)
+      from: prev?.from ?? from ?? (pending.length ? Math.min(...pending.map((m) => m.seq ?? 0)) - 1 : conv.msgCount),
+      question: [prev?.question, asked].filter(Boolean).join("\n"),
+      v: (conv.handoffCount = (conv.handoffCount || 0) + 1), // кнопки старой карточки отличим от новой
+      // Мастер нужен только потому, что ответ не ушёл: напишет клиент снова — бот попробует сам (см. processConv)
+      sendFailed: sendFailed && (!prev || Boolean(prev.sendFailed)),
+      open,
     });
     this.save();
     this.log.info(`→ мастеру: разговор ${conv.id} (${reason})`);
     await this.notifyHandoff(conv).catch((e) => this.log.error("Карточка мастеру:", e));
     // «Печатает…» идёт в фоне: если мастер успеет ответить или нажать кнопку, «уточню» не уйдёт
     if (!holdText) return;
-    this.run(async () => {
+    const task = this.run(async () => {
       try {
         const out = await this.deliver(conv, holdText, "bot", { hold: true });
         // Своё «уточню» не ушло совсем, а начатый ответ был только в нём. Он не пропадает: встаёт в начало
@@ -667,6 +831,8 @@ class App {
         this.holding.delete(conv.id);
       }
     });
+    this.holdTasks.set(conv.id, task);
+    task.finally(() => this.holdTasks.get(conv.id) === task && this.holdTasks.delete(conv.id));
   }
 
   async onEffect(conv, ef) {
@@ -708,10 +874,13 @@ class App {
   async takeover(conv, adminId, { quiet = false, relay = true, keepSetup = false } = {}) {
     this.cancelScheduled(conv.id);
     if (conv.status === "waiting" && conv.handoff) conv.takenHandoff = conv.handoff;
+    // С какого сообщения мастер ведёт диалог: отсюда бот перечитает переписку, когда её вернут (returnToBot)
+    if (conv.status !== "admin") conv.takenAt = conv.msgCount;
     conv.status = "admin";
     conv.handledBy = adminId;
     conv.handoff = null;
     conv.unsent = null; // отвечает мастер — недосланное бот уже не досылает
+    conv.recheck = null;
     // Взял диалог — его обычные сообщения теперь уходят клиенту, даже если он не закончил
     // настройку точки (иначе ответ клиенту попадал в «Обновляю данные…»)
     const a = this.admin(adminId);
@@ -750,7 +919,14 @@ class App {
     // не обязательно: сообщение об отмене записи из панели тоже уходит клиенту от имени мастера.
     const lost = resume && called?.lost && !this.masterWroteSince(conv, called.lost.after) ? called.lost : null;
     // Диалог уже у бота (кнопку нажали дважды подряд, проход ещё не начался) — недосланное остаётся за ним
-    if (!resume || conv.status !== "bot") conv.unsent = lost ? { ...lost, question: called.question, upTo: called.upTo } : null;
+    if (!resume || conv.status !== "bot") {
+      conv.unsent = lost ? { ...lost, question: called.question, upTo: called.upTo } : null;
+      // Если в конце переписки не окажется сообщения клиента без ответа, бот перечитает её с того места, где звали
+      // мастера или мастер взял диалог: пока мастер отвечал, клиент мог написать то, на что мастер не ответил,
+      // а пока вопрос ждал мастера, бот мог ответить на другое, и сам вопрос в конце уже не стоит
+      const since = called?.from ?? (conv.status === "admin" ? conv.takenAt : null);
+      conv.recheck = resume && since != null ? { since } : null;
+    }
     conv.status = "bot";
     conv.handledBy = null;
     conv.handoff = null;
@@ -982,7 +1158,7 @@ class App {
     if (h.question) lines.push(`💬 «${esc(truncate(h.question, 700))}»`);
     lines.push(`⚠️ ${esc(h.reason)}`);
     if (h.hold) lines.push(`🕐 Клиенту пишу: «${esc(truncate(h.hold, 300))}»`);
-    if (h.draft) lines.push(`📝 Черновик бота: «${esc(truncate(h.draft, 700))}»`);
+    if (h.draft) lines.push(`📝 Черновик бота${h.open ? " — только на последний вопрос" : ""}: «${esc(truncate(h.draft, 700))}»`);
     // Последняя строка — как ответить. Если обычное сообщение мастера сейчас ушло бы не этому клиенту
     // (в незакрытую настройку точки или другому клиенту), говорим об этом прямо в карточке
     // «Осталось непрочитанным» — только если это правда: «уточню» не уходило и бот ничего не отмечал прочитанным
@@ -994,7 +1170,7 @@ class App {
       return `<i>${where ? `${where} ${REPLY_HERE}` : "Ответьте реплаем на это сообщение — я передам клиенту."}</i>`;
     };
     const kb = [[{ text: "✋ Взять диалог", callback_data: `c:take:${conv.id}` }]];
-    if (h.draft) kb[0].push({ text: "✅ Отправить черновик", callback_data: `c:send:${conv.id}` });
+    if (h.draft) kb[0].push({ text: "✅ Отправить черновик", callback_data: `c:send:${conv.id}:${h.v || ""}` });
     kb.push([
       { text: "🔁 Бот, попробуй ещё", callback_data: `c:retry:${conv.id}` },
       { text: "📜 Переписка", callback_data: `c:open:${conv.id}` },
@@ -1019,8 +1195,8 @@ class App {
     );
   }
 
-  // Мастер ведёт диалог: пересылаем ему новые сообщения клиента
-  async forwardToHandler(conv, text) {
+  // Мастер ведёт диалог: пересылаем ему новые сообщения клиента (m — само сообщение: вложение уходит следом)
+  async forwardToHandler(conv, text, m = null) {
     const targets = conv.handledBy ? [conv.handledBy] : Object.keys(this.state.admins).map(Number);
     for (const id of targets) {
       if (conv.kind === "business" && this.conn(conv)?.userId === id) continue; // он и так видит чат у себя
@@ -1042,8 +1218,44 @@ class App {
         }
       }
       await this.notifyAdmin(id, lines.join("\n"), kb, conv.id);
+      if (m?.media) await this.sendMedia(id, conv, m);
     }
     this.save();
+  }
+
+  // ---------- вложения клиента ----------
+
+  // Показать вложение клиента всем мастерам (после карточки «Нужен ответ мастера»). Тот, к чьему Telegram подключён
+  // бот через Business, видит его у себя в чате.
+  async showMediaToAdmins(conv, m) {
+    for (const a of Object.values(this.state.admins)) {
+      if (a.notify === false) continue;
+      if (conv.kind === "business" && Number(this.conn(conv)?.userId) === Number(a.id)) continue;
+      await this.sendMedia(a.id, conv, m);
+    }
+    this.save();
+  }
+
+  // Отправить мастеру вложение из переписки. Реплай на него — ответ этому клиенту, как на любое сообщение о нём.
+  // file_id годится только тому боту, который его получил: если панель — отдельный бот, файл скачиваем и загружаем заново.
+  async sendMedia(adminId, conv, m) {
+    const [method, field, ext, label] = SEND_MEDIA[m.media.kind] || SEND_MEDIA.document;
+    const who = `<b>${esc(conv.client.name || "Клиент")}</b>`;
+    const caption = `📎 ${label} · ${who} · ${fmtTime(nowParts(this.shop.timezone, m.at).minutes)}\n<i>Ответьте реплаем, чтобы написать клиенту.</i>`;
+    const extra = m.media.kind === "video_note" ? {} : { caption, parse_mode: "HTML" };
+    try {
+      let sent;
+      if (!this.separateConsole) sent = await this.api.call(method, { chat_id: adminId, [field]: m.media.fileId, ...extra });
+      else {
+        const buf = await this.api.downloadFile(m.media.fileId);
+        sent = await this.consoleApi.upload(method, { chat_id: adminId, ...extra }, field, buf, m.media.name || `${m.media.kind}.${ext}`);
+      }
+      this.noteRef(adminId, sent?.message_id, conv.id);
+      return sent;
+    } catch (e) {
+      this.log.warn("Вложение мастеру:", e.message);
+      await this.notifyAdmin(adminId, `Не получилось показать вложение (${label.toLowerCase()}) от ${who}: ${esc(e.message)}`, null, conv.id);
+    }
   }
 }
 

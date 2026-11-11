@@ -30,8 +30,11 @@ function chunks(text, max = 3900) {
   return out;
 }
 
+// Подпись кнопки, по которой мастер смотрит вложение из переписки
+const MEDIA_BUTTON = { photo: "Фото", voice: "Голосовое", video_note: "Видеосообщение", video: "Видео", audio: "Аудио", animation: "Гифка", document: "Файл" };
+
 const STATUS = {
-  waiting: { icon: "🔴", text: "ждёт ответа мастера" },
+  waiting: { icon: "🔴", text: "вопрос ждёт мастера, на остальное отвечает бот" },
   admin: { icon: "✋", text: "ведёт мастер" },
   bot: { icon: "🤖", text: "ведёт бот" },
 };
@@ -140,10 +143,12 @@ const methods = {
     const lines = [`<b>${titles[kind]}</b>`, ""];
     if (!items.length) lines.push("Пока пусто 👌");
     for (const c of items) {
-      // «Уточню и скоро отвечу» и напоминания не показываем: важнее, что спросил клиент
+      // «Уточню и скоро отвечу» и напоминания не показываем: важнее, что спросил клиент. Если вопрос ждёт мастера —
+      // сам вопрос: на другое бот мог с тех пор ответить
       const last = [...c.messages].reverse().find((m) => !m.service && !m.hold && !m.notice);
+      const preview = c.status === "waiting" && c.handoff?.question ? c.handoff.question.split("\n").at(-1) : last ? this.panelText(last) : "";
       lines.push(
-        `${this.convIcon(c)} <b>${esc(c.client.name || "Клиент")}</b> — «${esc(truncate(last?.text || "", 70))}» · ${ago(c.updatedAt, this.now())}`
+        `${this.convIcon(c)} <b>${esc(c.client.name || "Клиент")}</b> — «${esc(truncate(preview, 70))}» · ${ago(c.updatedAt, this.now())}`
       );
     }
     const kb = items.map((c) => [btn(`${this.convIcon(c)} ${truncate(c.client.name || "Клиент", 30)} · ${ago(c.updatedAt, this.now())}`, `c:open:${c.id}`)]);
@@ -165,17 +170,18 @@ const methods = {
     if (c.phone) lines.push(`📞 ${esc(c.phone)}`);
     if (c.status === "waiting" && c.handoff) {
       lines.push(`⚠️ ${esc(c.handoff.reason)}`);
-      if (c.handoff.draft) lines.push(`📝 Черновик бота: «${esc(truncate(c.handoff.draft, 500))}»`);
+      if (c.handoff.draft) lines.push(`📝 Черновик бота${c.handoff.open ? " — только на последний вопрос" : ""}: «${esc(truncate(c.handoff.draft, 500))}»`);
     }
     const today = nowParts(tz, this.now()).date;
     const bookings = upcomingBookings(this.state, this.shop, { clientKey: c.id, now: this.now() });
     for (const b of bookings) lines.push(`🗓 ${b.id}: ${esc(b.serviceName)}, ${esc(bookingLabel(b, today))}, ${esc(b.staffName)}`);
     lines.push("", "<b>Последние сообщения</b>");
     const icons = { client: "👤", bot: "🤖", admin: "✂️" };
-    for (const m of c.messages.filter((x) => !x.service).slice(-12)) {
+    const shown = c.messages.filter((x) => !x.service).slice(-12);
+    for (const m of shown) {
       const p = nowParts(tz, m.at);
       const when = p.date === today ? fmtTime(p.minutes) : `${fmtDate(p.date)} ${fmtTime(p.minutes)}`;
-      lines.push(`${icons[m.role] || "•"} <i>${when}</i> ${esc(truncate(m.text, 400))}`);
+      lines.push(`${icons[m.role] || "•"} <i>${when}</i> ${esc(truncate(this.panelText(m), 400))}${m.media ? " 📎" : ""}`);
     }
     const own = this.isOwnChat(c, adminId);
     if (own) lines.push("", "<i>Это ваш собственный чат с ботом (проверка в роли клиента).</i>");
@@ -184,7 +190,7 @@ const methods = {
     if (c.status === "waiting") {
       const row = [];
       if (!own) row.push(btn("✋ Взять диалог", `c:take:${c.id}`));
-      if (c.handoff?.draft) row.push(btn("✅ Отправить черновик", `c:send:${c.id}`));
+      if (c.handoff?.draft) row.push(btn("✅ Отправить черновик", `c:send:${c.id}:${c.handoff.v || ""}`));
       if (row.length) kb.push(row);
       kb.push([btn("🔁 Бот, попробуй ещё", `c:retry:${c.id}`)]);
     }
@@ -195,6 +201,13 @@ const methods = {
       kb.push(row);
     }
     if (!c.session?.closed) kb.push([btn("✅ Завершить диалог", `c:close:${c.id}`)]);
+    // Вложения из показанных сообщений: по кнопке бот пришлёт само фото, голосовое или файл
+    const media = shown.filter((m) => m.media && m.seq).slice(-6);
+    for (let i = 0; i < media.length; i += 2) {
+      kb.push(
+        media.slice(i, i + 2).map((m) => btn(`📎 ${MEDIA_BUTTON[m.media.kind] || "Файл"} ${fmtTime(nowParts(tz, m.at).minutes)}`, `c:media:${c.id}:${m.seq}`))
+      );
+    }
     kb.push(BACK);
     const sent = await this.show(adminId, chunks(lines.join("\n"))[0], kb, cq);
     if (sent?.message_id) this.noteRef(adminId, sent.message_id, c.id);
@@ -202,7 +215,7 @@ const methods = {
   },
 
   async sendTakeoverHint(conv, adminId) {
-    const last = this.pendingClientMessages(conv).map((m) => m.text).join("\n");
+    const last = this.pendingClientMessages(conv).map((m) => this.panelText(m)).join("\n");
     const a = this.admin(adminId);
     const here = this.dialogFocus(a) === conv.id;
     const lines = [`✋ Вы ведёте диалог с <b>${esc(conv.client.name)}</b>. Бот в этом чате молчит.`];
@@ -658,9 +671,11 @@ const methods = {
       "❓ <b>Как это работает</b>",
       "",
       "• Бот отвечает клиентам: услуги, цены, адрес, свободное время, запись. Каждая услуга занимает 1–4 слота подряд.",
-      "• Если бот не знает ответа или клиент прислал фото/голосовое — бот пишет клиенту, что уточнит и скоро ответит, а вам присылает карточку с черновиком. Можно отправить черновик, ответить самому или дать боту попробовать ещё раз.",
+      "• Если бот не знает ответа или клиент прислал фото/голосовое — бот пишет клиенту, что уточнит и скоро ответит, а вам присылает карточку с черновиком и само вложение. Можно отправить черновик, ответить самому или дать боту попробовать ещё раз.",
+      "• Пока вопрос ждёт вас, на остальные сообщения клиента бот отвечает сам. Если и на новое нужен мастер, карточка придёт снова, с обоими вопросами. Бот замолкает, только когда вы взяли диалог или ответили клиенту.",
       "• Если ИИ не ответил вовремя или случился сбой — бот молчит и тоже присылает вам карточку.",
-      "• «Перехватить» — бот замолкает в этом чате, а ваши сообщения отсюда уходят клиенту. «Вернуть боту» — бот снова отвечает сам.",
+      "• «Перехватить» — бот замолкает в этом чате, а ваши сообщения отсюда уходят клиенту. «Вернуть боту» — бот снова отвечает сам: перечитывает переписку и отвечает на то, на что вы не ответили.",
+      "• Реакции клиента (👍 на «Записать вас?») бот понимает как ответ. Их и вложения видно в переписке: фото, голосовое или файл бот пришлёт по кнопке.",
       "• Ответить реплаем на уведомление — сообщение уйдёт этому клиенту, даже если вы сейчас настраиваете точку.",
       "• Обычные сообщения идут туда, что вы выбрали последним: в диалог, который взяли, или в настройку точки, которую открыли. Переключают кнопки «Писать сюда» и «Писать в настройку». Настройку, которую вы 15 минут не трогали, бот считает отложенной: когда клиент напишет снова или вы ответите ему реплаем, обычные сообщения опять пойдут клиенту.",
       "• «Завершить диалог» — разговор окончен: переписка возвращается боту и пропадает из «Незавершённых», а следующее сообщение клиента начнёт новый разговор. В «Текущих» она остаётся: там все переписки за сутки.",
@@ -754,7 +769,7 @@ const methods = {
     const answer = (text, alert = false) =>
       api.call("answerCallbackQuery", { callback_query_id: cq.id, ...(text ? { text, show_alert: alert } : {}) }).catch(() => {});
     if (!this.role(uid)) return answer("Нет доступа");
-    const [ns, act, arg] = String(cq.data || "").split(":");
+    const [ns, act, arg, extra] = String(cq.data || "").split(":");
     const a = this.admin(uid);
 
     if (ns === "m") {
@@ -835,18 +850,29 @@ const methods = {
           this.run(() => told);
           return;
         }
+        case "media": {
+          const m = conv.messages.find((x) => String(x.seq) === extra && x.media);
+          if (!m) return answer("Этого вложения уже нет в истории");
+          await answer();
+          return this.sendMedia(uid, conv, m);
+        }
         case "send": {
           if (conv.status !== "waiting" || !conv.handoff?.draft) return answer("Черновика уже нет");
+          // Кнопка из прежней карточки, а бот с тех пор позвал мастера ещё раз: черновик теперь другой, он в новой карточке
+          // (кнопка без номера — из карточки, которая этот черновик не показывала)
+          if (conv.handoff.v && extra !== String(conv.handoff.v)) return answer("Черновик обновился — он в последней карточке по этому клиенту", true);
           // «Уточню» ещё «печатается», а в нём бывает часть ответа (начатое до того, как клиент дописал):
           // отправь мы черновик сейчас, оно бы не ушло совсем. Пусть сначала уйдёт.
           if (this.holding.has(conv.id)) return answer("Секунду: бот дописывает клиенту — нажмите ещё раз");
           // Карточка ещё рассылается мастерам: проход бота не закончен, и черновик пошёл бы вперемешку с ним
           if (this.busy.has(conv.id)) return answer(BOT_BUSY);
           const handoff = conv.handoff;
-          // Черновик отвечает на то, что клиент написал до этой минуты. А если в нём то, что бот раньше не смог
-          // отправить, — только на прежние сообщения (draftAfter): что клиент написал после них, остаётся без
-          // ответа, и бот вернётся к этому, когда черновик уйдёт.
-          const seen = conv.msgCount;
+          // Черновик отвечает на то, что было до этой минуты, кроме того, что бот ещё не разобрал: пока вопрос ждёт мастера,
+          // на новое отвечает бот, и сообщение, которое клиент прислал за секунду до нажатия, остаётся за ним.
+          // А если в черновике то, что бот раньше не смог отправить, — только на прежние сообщения (draftAfter).
+          // Что клиент написал после, остаётся без ответа, и бот ответит на это, когда черновик уйдёт.
+          const fresh = this.pendingClientMessages(conv);
+          const seen = fresh.length ? Math.min(...fresh.map((m) => m.seq ?? 0)) - 1 : conv.msgCount;
           const after = handoff.draftAfter ?? seen;
           conv.status = "bot";
           conv.handoff = null;
@@ -869,14 +895,16 @@ const methods = {
               // черновиком (и помечено как недосланное: lost). ИИ заново не зовём. Что клиент дописал, пока бот
               // «печатал», показываем мастерам.
               const back = conv.status === "bot"; // иначе диалог уже взял мастер
-              const late = back ? conv.messages.filter((m) => m.role === "client" && !m.service && m.seq > seen).map((m) => m.text) : [];
               if (back) {
                 conv.status = "waiting";
-                conv.handoff = { ...handoff, draft: out.unsent, draftAfter: after, lost: { text: out.unsent, after } };
+                // Ответ мастер уже одобрил — напишет клиент снова, бот дошлёт его сам (см. processConv)
+                conv.handoff = { ...handoff, draft: out.unsent, draftAfter: after, lost: { text: out.unsent, after }, sendFailed: true };
                 this.save();
               }
+              // Что клиент написал после того, на что отвечал черновик
+              const late = back ? this.pendingClientMessages(conv).map((m) => this.panelText(m)) : [];
               const kb = [[btn("📜 Переписка", `c:open:${conv.id}`)]];
-              if (back) kb[0].unshift(btn("✅ Отправить ещё раз", `c:send:${conv.id}`));
+              if (back) kb[0].unshift(btn("✅ Отправить ещё раз", `c:send:${conv.id}:${conv.handoff.v || ""}`));
               await this.notifyAdmin(
                 uid,
                 `⚠️ Не удалось отправить черновик клиенту <b>${esc(conv.client.name)}</b>: ${esc(out.error)}` +
@@ -897,8 +925,17 @@ const methods = {
               );
               return;
             }
+            // Черновик был только у последнего вопроса: прежний, без черновика, снова ждёт мастера
+            const rest = handoff.open && conv.status === "bot" ? handoff.open : null;
+            if (rest) {
+              conv.status = "waiting";
+              const v = (conv.handoffCount = (conv.handoffCount || 0) + 1);
+              conv.handoff = { ...rest, hold: "", draft: "", draftAfter: null, lost: null, confidence: null, error: false, v, sendFailed: false, open: null };
+              this.save();
+            }
             if (!this.timers.has(conv.id)) this.schedule(conv.id, 0);
-            await this.notifyAdmin(uid, `✅ Черновик отправлен <b>${esc(conv.client.name)}</b>.`, null, conv.id);
+            await this.notifyAdmin(uid, `✅ Черновик отправлен <b>${esc(conv.client.name)}</b>.${rest ? " Вопрос, на который черновика не было, по-прежнему ждёт ответа — карточка ниже." : ""}`, null, conv.id);
+            if (rest) await this.notifyHandoff(conv).catch((e) => this.log.error("Карточка мастеру:", e));
           });
           return;
         }

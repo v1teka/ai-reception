@@ -105,6 +105,8 @@ function stablePrompt(shop) {
 - Отвечай на языке клиента.
 - Не называй себя ботом без повода. Если клиент прямо спрашивает, с роботом ли он общается, честно скажи, что ты онлайн-помощник точки и мастер может подключиться к переписке.
 - Клиент может написать несколько сообщений, не дожидаясь ответа. Отвечай на всё разом, как живой человек: если новое сообщение уточняет или меняет прежнее — отвечай на итоговый вопрос; если вопросы разные — ответь на каждый по порядку, можно отдельными сообщениями через пустую строку.
+- В квадратных скобках — пометки бота, а не слова клиента: вложения, реакции, «передано мастеру».
+- Реакция клиента на сообщение («[реакция 👍 на ваше сообщение «Записать вас на 15:00?»]») бывает ответом: тогда поступай как с ответом словами. Если реакция — просто эмоция и отвечать нечего, верни пустой reply и handoff = false.
 
 Например, клиент спросил только цену услуги (в угловых скобках — то, что берётся из данных точки):
 Слишком длинно: «Здравствуйте! <Услуга> у нас стоит <цена>, в неё входит <состав>, по времени <длительность>. Если хотите, могу подобрать удобное время — на какой день вас записать? 😊»
@@ -131,7 +133,7 @@ confidence (от 0 до 1):
 - 0.6–0.8 — уточняющий вопрос, приветствие, small talk, общий ответ без новых фактов о точке;
 - ниже 0.5 — пришлось догадываться или ответа в данных нет.
 
-Итог каждого хода — JSON по схеме: reply, confidence, handoff, handoff_reason, hold. Если мастер не нужен, reply не пустой: даже на «спасибо» или «ок» ответь парой слов, как ответил бы человек.
+Итог каждого хода — JSON по схеме: reply, confidence, handoff, handoff_reason, hold. Если мастер не нужен, reply не пустой: даже на «спасибо» или «ок» ответь парой слов, как ответил бы человек. Исключения — реакция-эмоция и пометка бота о том, что мастер вернул тебе переписку: там, если отвечать нечего, reply пустой.
 
 Данные точки:
 ${renderForPrompt(shop)}`;
@@ -139,6 +141,11 @@ ${renderForPrompt(shop)}`;
 
 // Пометка неотправленного ответа в истории для ИИ (см. buildMessages)
 const UNSENT = "[не отправлено]";
+// Пометка в истории: вопрос выше бот передал мастеру, и мастер ещё не ответил (см. buildMessages)
+const WITH_MASTER = "[передано мастеру, он ещё не ответил]";
+// Последнее «сообщение» в истории, когда мастер вернул переписку боту, а в её конце нет вопроса клиента без ответа
+const RECHECK_NOTE =
+  "[Пометка бота, не слова клиента: мастер вёл переписку и вернул её тебе. Перечитай её. Если на какое-то сообщение клиента ещё никто не ответил по существу — ни ты («уточню» — не ответ), ни мастер, — ответь на него. Если ответа ждать нечему, верни пустой reply и handoff = false: не прощайся и не добавляй ничего от себя.]";
 
 // Хвост переписки, на который бот ещё не ответил по существу, по порядку: сообщения клиента и то,
 // что ответом не считается, — «уточню и скоро отвечу» (hold) и напоминания (notice).
@@ -216,8 +223,15 @@ function dynamicPrompt({ shop, conv, state, now, draft = null }) {
     .filter((m) => m.role !== "client")
     .map((m) => `«${oneLine(m.text)}»`);
   if (asides.length) {
+    // Пока вопрос ждёт мастера, «ответь на всё» не годится: тот вопрос — за мастером
+    const waiting = conv.status === "waiting" && conv.handoff;
     lines.push(
-      `Клиенту уже ушло: ${asides.join(", ")}. Это не ответ по существу: не повторяй это и ответь на всё, что в переписке осталось без ответа.`
+      `Клиенту уже ушло: ${asides.join(", ")}. Это не ответ по существу: не повторяй это${waiting ? "." : " и ответь на всё, что в переписке осталось без ответа."}`
+    );
+  }
+  if (conv.status === "waiting" && conv.handoff) {
+    lines.push(
+      `Мастеру ты передал вопрос клиента: в истории после него стоит твоё «уточню» или пометка ${WITH_MASTER}. Мастер ещё не ответил. На этот вопрос сам не отвечай и ничего по нему не обещай — отвечай на то, что клиент написал после. Если клиент переспрашивает или торопит с тем вопросом, коротко скажи другими словами, что уточняешь. Если новое сообщение дополняет переданный вопрос или на него тоже нужен мастер — handoff = true.`
     );
   }
   if (draft?.text) {
@@ -233,13 +247,21 @@ function dynamicPrompt({ shop, conv, state, now, draft = null }) {
 // «Уточню» и напоминания в самом конце не передаём: ответ должен идти за вопросом клиента
 // (их ИИ увидит в dynamicPrompt). Неотправленный ответ (draft) ставим туда, где он был бы, —
 // перед тем, что клиент дописал, пока бот его печатал, — с пометкой UNSENT.
-function buildMessages(conv, { limit = 30, draft = null } = {}) {
+// Пока вопрос ждёт мастера, после него стоит пометка WITH_MASTER — перед тем, что клиент написал позже.
+// note — служебное «сообщение» в самом конце (RECHECK_NOTE): ИИ отвечает на него, когда вопроса клиента в конце нет.
+function buildMessages(conv, { limit = 30, draft = null, note = "" } = {}) {
   const items = conv.messages.filter((m) => !m.service).slice(-limit);
   items.splice(items.length - trailingAsides(items).length);
   if (draft?.text) {
     const i = replyIndex(items, draft.after);
     if (i < items.length) items.splice(i, 0, { role: "bot", text: `${UNSENT} ${draft.text}` });
   }
+  const upTo = conv.status === "waiting" ? conv.handoff?.upTo : null;
+  if (upTo != null) {
+    const i = items.findIndex((m) => m.role === "client" && (m.seq ?? 0) > upTo);
+    if (i > 0) items.splice(i, 0, { role: "bot", text: WITH_MASTER });
+  }
+  if (note) items.push({ role: "client", text: note });
   const out = [];
   for (const m of items) {
     const role = m.role === "client" ? "user" : "assistant";
@@ -309,10 +331,12 @@ function runTool(name, input, ctx) {
 
 // Один ход ассистента. Никогда не бросает: возвращает reply / handoff / error.
 // У handoff, который решила модель, есть hold — что сразу написать клиенту (может быть пустым).
-async function generateReply({ llm, cfg, state, shop, conv, draft = null, now = Date.now(), log = console }) {
+// recheck — мастер вернул переписку, и бот её перечитывает (в конце RECHECK_NOTE). silentOk — промолчать можно:
+// пустой reply без handoff тогда не зовёт мастера, а значит «отвечать не на что» (kind: "silent").
+async function generateReply({ llm, cfg, state, shop, conv, draft = null, recheck = false, silentOk = false, now = Date.now(), log = console }) {
   const effects = [];
   const deadline = Date.now() + cfg.llmTimeoutMs;
-  const messages = buildMessages(conv, { draft });
+  const messages = buildMessages(conv, { draft, note: recheck ? RECHECK_NOTE : "" });
   if (!messages.length || messages[messages.length - 1].role !== "user") {
     return { kind: "error", reason: "нечего отвечать", effects };
   }
@@ -367,7 +391,7 @@ async function generateReply({ llm, cfg, state, shop, conv, draft = null, now = 
         return { kind: "error", reason: "ИИ вернул ответ в неожиданном формате", effects };
       }
       const confidence = Math.max(0, Math.min(1, Number(out.confidence) || 0));
-      const clean = (t) => t.replaceAll(UNSENT, "").trim(); // ИИ мог повторить пометку вместе с ответом
+      const clean = (t) => t.replaceAll(UNSENT, "").replaceAll(WITH_MASTER, "").trim(); // ИИ мог повторить пометку вместе с ответом
       const reply = clean(out.reply);
       // Слишком длинное «уточню» — не то, о чём просили: тогда бот возьмёт короткую фразу по умолчанию
       const hold = typeof out.hold === "string" && clean(out.hold).length <= 400 ? clean(out.hold) : "";
@@ -376,6 +400,7 @@ async function generateReply({ llm, cfg, state, shop, conv, draft = null, now = 
       }
       // Мастера позвал сам бот, а не ИИ. Фразу ИИ клиенту не отправляем — в ней может быть та же
       // догадка, — бот напишет свою, без фактов.
+      if (!reply && silentOk) return { kind: "silent", confidence, effects };
       if (!reply) {
         // Пустой ответ при уверенности — ИИ решил, что отвечать нечего («ок», смайлик): «уточню» было бы
         // не к месту, мастер просто увидит карточку. Без уверенности — не знает ответа, как и ниже.
@@ -402,4 +427,4 @@ async function generateReply({ llm, cfg, state, shop, conv, draft = null, now = 
   }
 }
 
-module.exports = { generateReply, buildMessages, unansweredTail, replyIndex, runTool, TOOLS, REPLY_SCHEMA, stablePrompt, dynamicPrompt };
+module.exports = { generateReply, buildMessages, unansweredTail, replyIndex, runTool, TOOLS, REPLY_SCHEMA, stablePrompt, dynamicPrompt, WITH_MASTER, RECHECK_NOTE };
