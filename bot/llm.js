@@ -5,7 +5,9 @@ const Anthropic = AnthropicModule.default || AnthropicModule;
 class LlmError extends Error {
   constructor(reason, cause) {
     super(reason);
-    this.reason = reason; // по-русски, для мастера
+    // По-русски, для мастера и владельца точки. Без названий провайдера и модели:
+    // их видит только тот, кто обслуживает бота, — в логах (см. Llm.create).
+    this.reason = reason;
     this.cause = cause;
   }
 }
@@ -14,8 +16,8 @@ function explain(e, timedOut) {
   if (timedOut || e instanceof Anthropic.APIConnectionTimeoutError || e instanceof Anthropic.APIUserAbortError)
     return "ИИ не ответил вовремя (таймаут)";
   if (e instanceof Anthropic.RateLimitError) return "ИИ перегружен: превышен лимит запросов";
-  if (e instanceof Anthropic.AuthenticationError) return "ошибка ключа Anthropic API";
-  if (e instanceof Anthropic.PermissionDeniedError) return "нет доступа к Anthropic API";
+  if (e instanceof Anthropic.AuthenticationError) return "ИИ временно недоступен (ошибка ключа доступа)";
+  if (e instanceof Anthropic.PermissionDeniedError) return "ИИ временно недоступен (нет доступа)";
   if (e instanceof Anthropic.BadRequestError) return "ошибка запроса к ИИ";
   if (e instanceof Anthropic.APIConnectionError) return "нет связи с ИИ";
   if (e instanceof Anthropic.APIError) return `ИИ временно недоступен (${e.status || "ошибка"})`;
@@ -42,7 +44,8 @@ class Llm {
       return await this.send(params, ctrl.signal, timeoutMs);
     } catch (e) {
       if (e instanceof LlmError) throw e;
-      this.log.error("LLM:", e?.status || "", e?.message);
+      // Подробности (провайдер, модель, текст ошибки API) — только в лог
+      this.log.error(`LLM (Anthropic, ${this.model}):`, e?.name || "", e?.status || "", e?.message);
       throw new LlmError(explain(e, timedOut), e);
     } finally {
       clearTimeout(timer);

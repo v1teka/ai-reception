@@ -1,7 +1,6 @@
 // Настройка точки силами ИИ: импорт с Яндекс.Карт и правки словами/скриншотами.
 // Результат всегда — предложение (черновик), мастер подтверждает его кнопкой.
 const { textOf, parseJson, LlmError } = require("./llm");
-const { truncate } = require("./util");
 const { LLM_SHOP_SCHEMA, toLlmShop, fromLlmShop, emptyShop } = require("./shop");
 const { fetchOrgText, describeFetch, parseOrgId, looksLikeCaptcha } = require("./yandex");
 
@@ -13,7 +12,8 @@ const SETUP_SYSTEM = `Ты помогаешь мастеру барбершоп�
 - График (hours): все 7 дней недели; выходной — closed = true. Время в формате HH:MM. «Круглосуточно» — 00:00–24:00.
 - staff: имена мастеров, если они есть в источнике.
 - knowledge: прочие факты, которые пригодятся в ответах клиентам (оплата, парковка, удобства, правила, акции, особенности). Один факт — одна строка. Не повторяй то, что уже есть в других полях.
-- changes: коротко по-русски, что заполнено или изменено и что мастеру стоит проверить.`;
+- changes: коротко по-русски, что заполнено или изменено и что мастеру стоит проверить.
+- Нигде не называй модель, нейросеть или компанию, на которой ты работаешь.`;
 
 const EDIT_RULES = `Это правка текущих данных. Меняй только то, о чём говорит мастер, остальное верни без изменений. Если мастер сообщает новый факт — добавь его в knowledge. Если просит что-то убрать — убери. Если в сообщении прайс или график — обнови соответствующие поля. Если менять нечего — верни данные как есть, а changes оставь пустым.`;
 
@@ -74,8 +74,8 @@ async function safe(fn) {
   try {
     return await fn();
   } catch (e) {
-    // detail — исходный текст ошибки API, для владельца бота
-    if (e instanceof LlmError) return { ok: false, reason: e.reason, detail: e.cause?.message ? truncate(String(e.cause.message), 300) : "" };
+    // Исходный текст ошибки API (с названием провайдера и модели) уже в логе — в Telegram его не показываем
+    if (e instanceof LlmError) return { ok: false, reason: e.reason };
     throw e;
   }
 }
@@ -103,7 +103,7 @@ async function importFromYandex({ llm, cfg, url, prevShop, fetchImpl, log = cons
     );
     if (r.ok && r.shop.name) return { ...r, via: "page", details };
     const why = r.ok ? "ИИ не нашёл на странице название организации" : r.reason;
-    details.push(`Разбор страницы ИИ: ${why}${r.detail ? ` (${r.detail})` : ""}`);
+    details.push(`Разбор страницы ИИ: ${why}`);
     reason = `не получилось разобрать карточку (${why})`;
   }
 
@@ -123,7 +123,7 @@ async function importFromYandex({ llm, cfg, url, prevShop, fetchImpl, log = cons
       return { ...r, via: "web_fetch", details };
     }
     const why = r.ok ? "ИИ не получил данных со страницы" : r.reason;
-    const more = [r.detail, ...(r.fetched || [])].filter(Boolean);
+    const more = (r.fetched || []).filter(Boolean);
     details.push(`Запасной путь (ИИ сам открывает ссылку): ${why}${more.length ? `; ${more.join("; ")}` : ""}`);
   } else {
     details.push("Запасной путь (ИИ сам открывает ссылку): выключен (YANDEX_WEB_FETCH=off)");
@@ -152,7 +152,7 @@ async function noteFromImages({ llm, cfg, imageList, caption }) {
     const resp = await llm.create(
       {
         max_tokens: 4000,
-        system: "Перепиши полезную для клиентов информацию с изображения в виде короткой заметки на русском. Без вступлений.",
+        system: "Перепиши полезную для клиентов информацию с изображения в виде короткой заметки на русском. Без вступлений. Не упоминай, какая модель или нейросеть это сделала.",
         messages: [{ role: "user", content: [...images(imageList), { type: "text", text: caption || "Сделай заметку." }] }],
         output_config: { effort: "low" },
       },

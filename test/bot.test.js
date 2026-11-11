@@ -449,6 +449,33 @@ test("ошибка API — мастеру молча; просьба позва�
   assert.match(tg.sentTo(OWNER).at(-1).params.text, /клиент просит мастера/);
 });
 
+test("нет доступа к ИИ: ни клиент, ни мастер не видят названий провайдера и модели", async () => {
+  const PROVIDER = /anthropic|claude|openai|chatgpt|gpt|opus|sonnet|haiku|api key|x-api-key/i;
+  for (const [status, uid, why] of [
+    [401, 520, /ошибка ключа доступа/],
+    [403, 521, /нет доступа/],
+    [429, 522, /превышен лимит/],
+    [529, 523, /временно недоступен/],
+  ]) {
+    const app = await makeApp();
+    an.respond = () => ({ status, error: "Anthropic API: invalid x-api-key for model claude-opus-5-5" });
+    await clientSays(app, uid, "Привет");
+    await app.idle();
+    const toOwner = tg.sentTo(OWNER).map((m) => m.params.text).join("\n");
+    assert.match(toOwner, why);
+    assert.doesNotMatch(toOwner, PROVIDER, `мастеру при ${status}`);
+    assert.doesNotMatch(tg.sentTo(uid).map((m) => m.params.text).join("\n"), PROVIDER, `клиенту при ${status}`);
+  }
+});
+
+test("промпт запрещает называть модель и провайдера", async () => {
+  const app = await makeApp();
+  await clientSays(app, 524, "Ты ChatGPT или Claude?");
+  await app.idle();
+  const system = JSON.stringify(an.requests.at(-1).body.system);
+  assert.match(system, /Никогда не называй модель, нейросеть, компанию-разработчика/);
+});
+
 test("голосовое → сразу мастеру, без ИИ; клиенту «послушаю и скоро отвечу»", async () => {
   const app = await makeApp();
   await clientSays(app, 507, undefined, { voice: { file_id: "v1", duration: 3 } });
@@ -1089,7 +1116,8 @@ test("настройка: владелец видит ошибку ИИ и от�
   assert.match(text, /Причина:<\/b> не получилось разобрать карточку \(ошибка запроса к ИИ\)/);
   assert.match(text, /Карточка: HTTP 200/);
   assert.match(text, /Вкладка «Цены»: HTTP 200/);
-  assert.match(text, /Разбор страницы ИИ: ошибка запроса к ИИ \(400 .*bad request/);
+  assert.match(text, /Разбор страницы ИИ: ошибка запроса к ИИ/);
+  assert.doesNotMatch(text, /bad request|anthropic|claude/i, "текст ошибки API с названием провайдера — только в логах");
   assert.match(text, /Запасной путь \(ИИ сам открывает ссылку\): ИИ не получил данных со страницы; https:\/\/yandex\.ru\/maps\/org\/x\/123456789\/ → ошибка url_not_accessible/);
   // Владелец сам загружал — отдельного уведомления ему нет
   assert.equal(tg.sentTo(OWNER).filter((m) => /Не получилось загрузить точку/.test(m.params.text)).length, 0);
