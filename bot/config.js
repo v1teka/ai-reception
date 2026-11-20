@@ -21,7 +21,7 @@ function loadConfig(env = process.env) {
     anthropicApiKey: env.ANTHROPIC_API_KEY || undefined,
     anthropicBaseUrl: env.ANTHROPIC_BASE_URL || undefined,
     model: env.ANTHROPIC_MODEL || "claude-opus-5-5",
-    effort: env.ANTHROPIC_EFFORT || "low", // чат: важна скорость
+    effort: env.ANTHROPIC_EFFORT || "high", // чат: качество ответа важнее скорости; low — быстрее и дешевле
     setupEffort: env.ANTHROPIC_SETUP_EFFORT || "medium", // разбор карточки и прайса
     fallbacks: !off(env.ANTHROPIC_FALLBACKS),
     yandexWebFetch: !off(env.YANDEX_WEB_FETCH),
@@ -33,10 +33,10 @@ function loadConfig(env = process.env) {
     confidenceThreshold: num(env.CONFIDENCE_THRESHOLD, 0.6),
 
     typing: {
-      baseMs: num(env.TYPING_BASE_MS, 400),
-      perCharMs: num(env.TYPING_MS_PER_CHAR, 12),
-      minMs: num(env.TYPING_MIN_MS, 800),
-      maxMs: num(env.TYPING_MAX_MS, 4000),
+      baseMs: num(env.TYPING_BASE_MS, 1000),
+      perCharMs: num(env.TYPING_MS_PER_CHAR, 50),
+      minMs: num(env.TYPING_MIN_MS, 2000),
+      maxMs: num(env.TYPING_MAX_MS, 12000),
       pauseMs: num(env.TYPING_PAUSE_MS, 500), // пауза между «пузырями»
     },
     debounceMs: num(env.DEBOUNCE_MS, 1500), // ждём, не допишет ли клиент ещё

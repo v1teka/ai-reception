@@ -134,7 +134,7 @@ test("бот отвечает: сначала «печатает» пропор�
   assert.equal(req.body.model, "claude-opus-5-5");
   assert.equal(req.body.fallbacks, "default");
   assert.match(req.headers["anthropic-beta"], /server-side-fallback-2026-07-01/);
-  assert.equal(req.body.output_config.effort, "low");
+  assert.equal(req.body.output_config.effort, "high");
   assert.equal(req.body.output_config.format.type, "json_schema");
   assert.deepEqual(req.body.tools.map((t) => t.name), ["get_free_slots", "create_booking", "list_client_bookings", "cancel_booking"]);
   assert.deepEqual(req.body.system[0].cache_control, { type: "ephemeral" });
