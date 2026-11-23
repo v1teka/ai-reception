@@ -150,6 +150,7 @@ test("данные прежней версии — первое заведени
   old.load();
   Object.assign(old.state.shop, { name: "Барбершоп «Бородач»", city: "Москва", demo: false });
   old.state.admins[555] = { id: 555, role: "owner", name: "Олег", notify: true, mode: null };
+  old.state.businessConnections.bc1 = { id: "bc1", userId: 555, userChatId: 555, rights: { can_reply: true }, enabled: true, allowed: true, name: "Олег", at: 0 };
   old.state.offsets = { main: 4242 };
   old.flush();
 
@@ -169,6 +170,22 @@ test("данные прежней версии — первое заведени
   await p.idle();
   assert.equal(lastTo(501), "Здравствуйте! Чем помочь?");
   assert.ok(convOf(p.apps.get("v1"), 501));
+
+  // Ссылка с чужим параметром (реклама, старая метка) и просто /start — приветствие этой же точки, как раньше
+  await says(p, 502, "/start promo");
+  await says(p, 503, "/start");
+  await p.idle();
+  assert.match(lastTo(502), /Это Барбершоп «Бородач»/);
+  assert.match(lastTo(503), /Это Барбершоп «Бородач»/);
+
+  // Клиент пишет мастеру в личку, а отвечает бот через Telegram Business, подключённый прежней версией
+  await p.handleShared({
+    update_id: ++upd,
+    business_message: { business_connection_id: "bc1", message_id: 7001, chat: { id: 607, type: "private", first_name: "Анна" }, from: user(607, "Анна"), date: 0, text: "Есть время завтра?" },
+  });
+  await p.idle();
+  const biz = tg.of("sendMessage", (q) => q.business_connection_id === "bc1" && q.chat_id === 607).at(-1);
+  assert.equal(biz?.params.text, "Здравствуйте! Чем помочь?");
 
   // Кнопка из сообщения, отправленного прежней версией (без пометки заведения), — тоже в первое заведение
   await press(p, 555, "m:panel");
@@ -226,9 +243,13 @@ test("владелец присылает карточку с Яндекс.Ка�
   assert.ok(convOf(app, 501));
   assert.equal(convOf(p.apps.get("v1"), 501), null);
 
-  // Неизвестная ссылка
+  // Не ссылка заведения — обычный /start там, где человек сейчас, а у нового человека — в основном заведении
+  await says(p, 501, "/start nope");
   await says(p, 502, "/start nope");
-  assert.match(lastTo(502), /Не нашёл заведение по этой ссылке/);
+  await p.idle();
+  assert.match(lastTo(501), /Это Барбершоп Тест/);
+  assert.ok(texts(502).some((t) => /Это Демо-барбершоп «Бритва»/.test(t)));
+  assert.equal(p.userVenue(502), "v1");
 });
 
 test("карточка не загрузилась — владелец видит причину и может создать пустое заведение", async () => {
@@ -458,8 +479,15 @@ test("удалённое заведение: клиенты узнают, что
   assert.match(lastTo(501), /больше не работает в этом боте/);
   await press(p, 501, oldButton);
   assert.match(tg.of("answerCallbackQuery").at(-1).params.text, /больше не работает/);
+  // Дальше он, как и все без ссылки, пишет основному заведению — без ответа не остаётся
+  an.respond = () => confident("Здравствуйте, это «Бритва»!");
+  await says(p, 501, "Ау?");
+  await p.idle();
+  assert.equal(lastTo(501), "Здравствуйте, это «Бритва»!");
+  // Ссылка удалённого заведения ведёт в основное
   await says(p, 503, "/start test");
-  assert.match(lastTo(503), /Не нашёл заведение/);
+  await p.idle();
+  assert.ok(texts(503).some((t) => /Это Демо-барбершоп «Бритва»/.test(t)));
 
   // Основное заведение удалить нельзя
   await press(p, OWNER, "P:del2:v1");

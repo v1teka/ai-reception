@@ -823,7 +823,9 @@ class Platform {
       return app?.handleUpdate(u, source);
     }
     const rec = this.venueBySlug(payload);
-    if (!rec) return api.sendMessage(uid, "Не нашёл заведение по этой ссылке. Возможно, она устарела — попросите у заведения новую.");
+    // Не ссылка заведения (рекламная метка, ссылка удалённого заведения): как и до нескольких заведений — обычный
+    // /start там, где человек сейчас, или в основном заведении. Без ответа не остаётся никто.
+    if (!rec) return this.routeMessage({ ...u, message: { ...msg, text: "/start" } }, source);
     if (this.movedTo(rec)) return this.sayMoved(uid, rec, api);
     this.enter(uid, rec.id);
     // Заведение видит обычный /start: клиенту — приветствие точки, мастеру — его панель
