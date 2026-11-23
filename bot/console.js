@@ -128,6 +128,8 @@ const methods = {
     kb.push([btn("⚙️ Настройки точки", "m:settings")]);
     kb.push([btn(`🔔 Уведомления: ${a?.notify !== false ? "вкл" : "выкл"}`, "m:notify"), btn("❓ Помощь", "m:help")]);
     if (this.role(adminId) === "owner") kb.push([btn("👤 Пригласить мастера", "m:invite")]);
+    // Владельцу платформы — переход к списку заведений
+    kb.push(...(this.platform?.panelRows(this, adminId) || []));
     return this.show(adminId, lines.join("\n"), kb, cq);
   },
 
@@ -164,7 +166,7 @@ const methods = {
     const tz = this.shop.timezone;
     const st = STATUS[c.status];
     const lines = [
-      `${st.icon} <b>${esc(c.client.name || "Клиент")}</b>${c.client.username ? ` @${esc(c.client.username)}` : ""} · ${st.text}`,
+      `${this.venueLabel(adminId)}${st.icon} <b>${esc(c.client.name || "Клиент")}</b>${c.client.username ? ` @${esc(c.client.username)}` : ""} · ${st.text}`,
       c.kind === "business" ? "📱 Пишет вам в Telegram (через Business)" : "🤖 Пишет боту",
     ];
     if (c.phone) lines.push(`📞 ${esc(c.phone)}`);
@@ -607,8 +609,12 @@ const methods = {
         if (!a.pending) return say("Нечего сохранять.");
         this.state.shop = { ...a.pending, updatedAt: this.now() };
         this.setMode(a, null, { pending: null, freshBase: false });
+        // У заведения, созданного пустым, появилось название — платформа даёт ему ссылку для клиентов
+        const named = this.platform?.onShopSaved(this);
         await say("✅ Сохранено. Бот уже отвечает клиентам по новым данным.");
-        return this.showSettings(adminId);
+        await this.showSettings(adminId);
+        if (named) await this.platform.sendVenueLinks(this, adminId);
+        return;
       }
       case "cancel": {
         this.setMode(a, null, { pending: null, freshBase: false });
@@ -620,11 +626,16 @@ const methods = {
 
   // ---------- доступы ----------
 
-  async createInvite(adminId) {
+  // Новая одноразовая ссылка-приглашение мастера (на 7 дней)
+  inviteLink(by) {
     const code = randomCode(8);
-    this.state.invites[code] = { role: "admin", by: adminId, createdAt: this.now(), expiresAt: this.now() + 7 * DAY };
+    this.state.invites[code] = { role: "admin", by, createdAt: this.now(), expiresAt: this.now() + 7 * DAY };
     this.save();
-    const link = `https://t.me/${this.consoleMe.username}?start=adm_${code}`;
+    return `https://t.me/${this.consoleMe.username}?start=adm_${code}`;
+  },
+
+  async createInvite(adminId) {
+    const link = this.inviteLink(adminId);
     return this.sendHtml(
       adminId,
       `👤 <b>Приглашение для мастера</b>\n\nОтправьте эту ссылку мастеру. По ней он получит панель: переписки, записи и настройку своей точки — Яндекс.Карты, услуги и любые «знания».\nСсылка одноразовая, действует 7 дней.\n\n${esc(link)}`
@@ -638,10 +649,22 @@ const methods = {
     }
     inv.usedBy = user.id;
     const a = this.ensureAdmin(user, inv.role || "admin");
-    this.startSetup(a, "await_yandex", { freshBase: true, pending: null });
+    // Точку уже загрузили (например, владелец создал заведение по карточке с Яндекс.Карт): мастер сразу видит
+    // свои данные, а не просьбу прислать ссылку
+    const ready = !this.shop.demo && Boolean(this.shop.name);
+    if (!ready) this.startSetup(a, "await_yandex", { freshBase: true, pending: null });
     await this.setCommands().catch(() => {});
-    for (const o of Object.values(this.state.admins).filter((x) => x.role === "owner")) {
-      await this.notifyAdmin(o.id, `👤 ${esc(userName(user))} принял приглашение и стал мастером.`);
+    // Заведение передали своему мастеру: платформа может выключить владельцу уведомления о его клиентах
+    const note = this.platform ? this.platform.onAdminJoined(this, user) : "";
+    for (const o of Object.values(this.state.admins).filter((x) => x.role === "owner" && Number(x.id) !== Number(user.id))) {
+      await this.notifyAdmin(o.id, `👤 ${esc(userName(user))} принял приглашение и стал мастером.${note}`);
+    }
+    if (ready) {
+      return this.sendHtml(
+        user.id,
+        `Добро пожаловать, ${esc(user.first_name || "мастер")}! 💈\n\nЯ онлайн-администратор <b>${esc(this.shop.name)}</b>: отвечаю клиентам 24/7, показываю свободное время и записываю. Если я не уверен или что-то сломалось — сразу зову вас.\n\n<b>Данные вашей точки уже загружены:</b>\n${renderSummary(this.shop)}\n\nПроверьте их: если что-то не так, откройте «Настройки точки» и напишите, что поправить, — словами или фото прайса.`,
+        { reply_markup: { inline_keyboard: [[btn("⚙️ Настройки точки", "m:settings"), btn("💈 Меню", "m:panel")]] } }
+      );
     }
     return this.sendHtml(
       user.id,
@@ -651,6 +674,8 @@ const methods = {
   },
 
   async claimOwner(user, code, api) {
+    // Заведений несколько: владелец — один на все, его назначает платформа (и в своём боте заведения тоже)
+    if (this.platform) return this.platform.claimOwner(user, code, api);
     if (!this.state.ownerClaimCode || code !== this.state.ownerClaimCode) {
       return api.sendMessage(user.id, "Ссылка владельца недействительна.");
     }
@@ -664,6 +689,24 @@ const methods = {
       "👑 Готово, вы владелец бота. Отсюда можно пригласить мастера: он получит панель и сам настроит точку.",
       { reply_markup: { inline_keyboard: [[btn("👤 Пригласить мастера", "m:invite")], [btn("💈 Панель", "m:panel")]] } }
     );
+  },
+
+  // Убрать мастера из точки (не владельца): диалоги, которые он вёл, возвращаются боту, его Telegram Business
+  // больше не подключён к точке. false — такого мастера нет или убрать его нельзя (владелец, ADMIN_IDS).
+  async removeAdmin(adminId, { by = null } = {}) {
+    const a = this.state.admins[adminId];
+    if (!a || this.role(adminId) === "owner" || this.cfg.adminIds.includes(Number(adminId))) return false;
+    const resume = [];
+    for (const c of Object.values(this.state.conversations)) {
+      if (c.status !== "admin" || Number(c.handledBy) !== Number(adminId)) continue;
+      await this.returnToBot(c, { by: by ?? adminId, resume: true });
+      resume.push(c.id);
+    }
+    delete this.state.admins[adminId];
+    for (const bc of Object.values(this.state.businessConnections)) if (Number(bc.userId) === Number(adminId)) bc.allowed = false;
+    this.save();
+    for (const id of resume) this.run(() => this.processConv(id));
+    return true;
   },
 
   helpText() {

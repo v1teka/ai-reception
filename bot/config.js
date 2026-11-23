@@ -10,6 +10,8 @@ const ids = (v) =>
 const off = (v) => /^(0|off|false|no|нет)$/i.test(String(v || "").trim());
 
 function loadConfig(env = process.env) {
+  const dataFile = env.DATA_FILE || path.join(env.DATA_DIR || path.join(__dirname, "..", "data"), "state.json");
+  const dataDir = env.DATA_DIR || path.dirname(dataFile);
   return {
     telegramToken: env.TELEGRAM_BOT_TOKEN || "",
     // Необязательно: отдельный бот для панели мастера (удобно, когда один человек тестирует обе роли)
@@ -41,7 +43,15 @@ function loadConfig(env = process.env) {
     },
     debounceMs: num(env.DEBOUNCE_MS, 1500), // ждём, не допишет ли клиент ещё
     reminderMinutes: num(env.REMINDER_MINUTES, 120),
-    dataFile: env.DATA_FILE || path.join(env.DATA_DIR || path.join(__dirname, "..", "data"), "state.json"),
+    // Данные: state.json — первое заведение (так было до нескольких заведений), platform.json — список заведений,
+    // venues/<id>/state.json — остальные заведения
+    dataFile,
+    dataDir,
+    // Заведения, подготовленные заранее (venues/<slug>.json в репозитории): создаются при запуске, каждое один раз.
+    // VENUES_DIR=off — не создавать
+    venuesDir: off(env.VENUES_DIR) ? "" : env.VENUES_DIR || path.join(__dirname, "..", "venues"),
+    // Управление с сервера: node bot/cli.js … говорит с запущенным ботом через этот сокет. CONTROL_SOCKET=off — выключить
+    controlSocket: off(env.CONTROL_SOCKET) ? "" : env.CONTROL_SOCKET || path.join(dataDir, "control.sock"),
   };
 }
 

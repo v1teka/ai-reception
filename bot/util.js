@@ -17,6 +17,15 @@ function esc(s) {
     .replace(/>/g, "&gt;");
 }
 
+// HTML для Telegram → простой текст (для консоли сервера и когда Telegram не разобрал разметку)
+function plain(html) {
+  return String(html ?? "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
 function truncate(s, n) {
   s = String(s ?? "");
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
@@ -58,4 +67,30 @@ function userName(u) {
   return name || (u.username ? "@" + u.username : "Клиент");
 }
 
-module.exports = { sleep, atMost, esc, truncate, oneLine, randomCode, seededRandom, clamp, userName };
+const TRANSLIT = {
+  а: "a", б: "b", в: "v", г: "g", д: "d", е: "e", ё: "e", ж: "zh", з: "z", и: "i", й: "y", к: "k", л: "l", м: "m",
+  н: "n", о: "o", п: "p", р: "r", с: "s", т: "t", у: "u", ф: "f", х: "kh", ц: "ts", ч: "ch", ш: "sh", щ: "sch",
+  ъ: "", ы: "y", ь: "", э: "e", ю: "yu", я: "ya", і: "i", ї: "yi", є: "ye", ґ: "g", ў: "u",
+};
+// Слова, которые есть в названии почти каждой точки: в ссылке они ничего не различают
+const GENERIC_WORDS = new Set(["barbershop", "barber", "shop", "salon", "studiya", "studio", "parikmakherskaya", "krasoty", "demo", "the", "i", "na", "v"]);
+
+// Название → короткая латиница для ссылки на заведение: «Барбершоп «Бородач»» → borodach.
+// Только a-z, 0-9 и дефис: такое Telegram принимает в ?start=, и с приглашениями (adm_…) не путается.
+function slugify(name, { max = 24, keepGeneric = false } = {}) {
+  const words = [...String(name || "").toLowerCase()]
+    .map((ch) => TRANSLIT[ch] ?? ch)
+    .join("")
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  const meaningful = keepGeneric ? words : words.filter((w) => !GENERIC_WORDS.has(w));
+  let out = "";
+  for (const w of meaningful.length ? meaningful : words) {
+    const next = out ? `${out}-${w}` : w;
+    if (next.length > max) break;
+    out = next;
+  }
+  return out || (words[0] || "").slice(0, max);
+}
+
+module.exports = { sleep, atMost, esc, plain, truncate, oneLine, randomCode, seededRandom, clamp, userName, slugify };
