@@ -47,9 +47,22 @@ const sameReaction = (a, b) => a.type === b.type && a.emoji === b.emoji && a.cus
 // Черновик без начатого ответа в начале: начатое клиент получает отдельным сообщением, второй раз не повторяем
 const withoutStart = (text, start) => (start && text.startsWith(start) ? text.slice(start.length).trim() : text);
 
+// Команды в меню Telegram у мастера
+const ADMIN_COMMANDS = [
+  { command: "panel", description: "Панель мастера" },
+  { command: "chats", description: "Текущие переписки" },
+  { command: "bookings", description: "Записи" },
+  { command: "settings", description: "Настройки точки и знания" },
+  { command: "help", description: "Как это работает" },
+];
+
+// Один App — одна точка (заведение). Когда заведений несколько, их App создаёт и держит Platform (platform.js):
+// platform — она сама (владельцы, подписи уведомлений, меню команд), venueId — какое это заведение.
 class App {
-  constructor({ cfg, store, api, consoleApi, llm, log = console, now = () => Date.now(), sleep = realSleep, fetchImpl }) {
+  constructor({ cfg, store, api, consoleApi, llm, log = console, now = () => Date.now(), sleep = realSleep, fetchImpl, platform = null, venueId = null }) {
     this.cfg = cfg;
+    this.platform = platform;
+    this.venueId = venueId;
     this.store = store;
     this.api = api; // бот для клиентов
     this.consoleApi = consoleApi || api; // бот с панелью мастера (может быть тем же)
@@ -107,7 +120,8 @@ class App {
     for (const id of this.cfg.ownerIds) this.ensureAdmin({ id }, "owner");
     for (const id of this.cfg.adminIds) if (!this.state.admins[id]) this.ensureAdmin({ id }, "admin");
     const hasOwner = Object.values(this.state.admins).some((a) => a.role === "owner");
-    if (!hasOwner) {
+    // Владельца платформы с несколькими заведениями назначает сама платформа (одна ссылка own_ на все заведения)
+    if (!hasOwner && !this.platform) {
       this.state.ownerClaimCode = this.state.ownerClaimCode || randomCode(9);
       this.log.info(
         `\n👑 Владельца ещё нет. Откройте ссылку, чтобы стать владельцем бота:\n   https://t.me/${this.consoleMe.username}?start=own_${this.state.ownerClaimCode}\n`
@@ -136,13 +150,9 @@ class App {
   }
 
   async setCommands() {
-    const adminCommands = [
-      { command: "panel", description: "Панель мастера" },
-      { command: "chats", description: "Текущие переписки" },
-      { command: "bookings", description: "Записи" },
-      { command: "settings", description: "Настройки точки и знания" },
-      { command: "help", description: "Как это работает" },
-    ];
+    // Заведений несколько: меню у человека одно на все его заведения в этом боте — его собирает платформа
+    if (this.platform) return this.platform.syncCommands(this);
+    const adminCommands = ADMIN_COMMANDS;
     if (this.separateConsole) {
       await this.consoleApi.call("setMyCommands", { commands: adminCommands });
     } else {
@@ -164,13 +174,27 @@ class App {
     return p;
   }
 
+  // Ничего не идёт и не запланировано: ни ответов, ни ожидания, не допишет ли клиент, ни разбора настройки
+  quiet() {
+    return !this.tasks.size && !this.timers.size && !this.busy.size && ![...this.setupBuffers.values()].some((b) => b.timer);
+  }
+
   async idle(maxMs = 20000) {
     const until = Date.now() + maxMs;
     while (Date.now() < until) {
-      if (!this.tasks.size && !this.timers.size && !this.busy.size && ![...this.setupBuffers.values()].some((b) => b.timer)) return;
+      if (this.quiet()) return;
       await Promise.race([...this.tasks, realSleep(10)]);
     }
     throw new Error("idle timeout");
+  }
+
+  // Заведение удалили: запланированные ответы и разбор настройки больше не начинаются, файл не пишется
+  stop() {
+    for (const t of this.timers.values()) clearTimeout(t);
+    this.timers.clear();
+    for (const b of this.setupBuffers.values()) clearTimeout(b.timer);
+    this.setupBuffers.clear();
+    this.store.close?.();
   }
 
   // ---------- роли ----------
@@ -1120,9 +1144,14 @@ class App {
     }
   }
 
+  // Мастеру нескольких заведений в одном боте — над уведомлением название заведения, иначе пусто
+  venueLabel(adminId) {
+    return this.platform?.adminLabel(this, adminId) || "";
+  }
+
   async notifyAdmin(adminId, text, keyboard, convId) {
     try {
-      const sent = await this.sendHtml(adminId, text, keyboard ? { reply_markup: { inline_keyboard: keyboard } } : {});
+      const sent = await this.sendHtml(adminId, this.venueLabel(adminId) + text, keyboard ? { reply_markup: { inline_keyboard: keyboard } } : {});
       this.noteRef(adminId, sent?.message_id, convId);
       return sent;
     } catch (e) {
@@ -1241,7 +1270,7 @@ class App {
   async sendMedia(adminId, conv, m) {
     const [method, field, ext, label] = SEND_MEDIA[m.media.kind] || SEND_MEDIA.document;
     const who = `<b>${esc(conv.client.name || "Клиент")}</b>`;
-    const caption = `📎 ${label} · ${who} · ${fmtTime(nowParts(this.shop.timezone, m.at).minutes)}\n<i>Ответьте реплаем, чтобы написать клиенту.</i>`;
+    const caption = `${this.venueLabel(adminId)}📎 ${label} · ${who} · ${fmtTime(nowParts(this.shop.timezone, m.at).minutes)}\n<i>Ответьте реплаем, чтобы написать клиенту.</i>`;
     const extra = m.media.kind === "video_note" ? {} : { caption, parse_mode: "HTML" };
     try {
       let sent;
@@ -1259,5 +1288,5 @@ class App {
   }
 }
 
-module.exports = { App, HOUR };
+module.exports = { App, HOUR, ADMIN_COMMANDS };
 require("./console").install(App);

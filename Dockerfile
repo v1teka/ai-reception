@@ -4,6 +4,8 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY bot ./bot
+# Заведения, подготовленные заранее: бот создаёт их при запуске (см. venues/README.md)
+COPY venues ./venues
 ENV DATA_DIR=/app/data
 VOLUME /app/data
 CMD ["node", "bot/index.js"]

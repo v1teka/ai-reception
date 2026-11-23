@@ -20,6 +20,8 @@ const ALLOWED_UPDATES = [
   "deleted_business_messages",
   // Реакции клиента в чате с ботом (Telegram присылает их, только если попросить явно)
   "message_reaction",
+  // Бот создан через t.me/newbot/<наш бот>/… и передан нам в управление (Telegram Managed Bots, см. platform.js)
+  "managed_bot",
 ];
 
 class TelegramApi {
@@ -138,4 +140,57 @@ class Poller {
   }
 }
 
-module.exports = { TelegramApi, TelegramError, Poller, ALLOWED_UPDATES };
+// Один общий бот на несколько заведений: к callback_data кнопок дописываем заведение («v2|c:open:5»), чтобы нажатие
+// попало туда, откуда пришло сообщение, даже если человек с тех пор переключился на другое (см. Platform.routeCallback).
+// Остальное — как у TelegramApi, которому этот объект и передаёт вызовы.
+const TAG_RE = /^(v\d+)\|([\s\S]*)$/;
+
+function tagMarkup(markup, tag) {
+  if (!Array.isArray(markup?.inline_keyboard)) return markup;
+  const row = (r) => r.map((b) => (typeof b.callback_data === "string" && !TAG_RE.test(b.callback_data) ? { ...b, callback_data: `${tag}|${b.callback_data}` } : b));
+  return { ...markup, inline_keyboard: markup.inline_keyboard.map(row) };
+}
+
+// «v2|c:open:5» → { venue: "v2", data: "c:open:5" }; кнопки без пометки (из сообщений до заведений) — { venue: null }
+function untag(data) {
+  const m = String(data ?? "").match(TAG_RE);
+  return m ? { venue: m[1], data: m[2] } : { venue: null, data: String(data ?? "") };
+}
+
+class TaggedApi {
+  constructor(base, tag) {
+    this.base = base;
+    this.tag = tag;
+  }
+
+  get me() {
+    return this.base.me;
+  }
+
+  tagged(params) {
+    return params?.reply_markup ? { ...params, reply_markup: tagMarkup(params.reply_markup, this.tag) } : params;
+  }
+
+  call(method, params = {}, opts) {
+    return this.base.call(method, this.tagged(params), opts);
+  }
+
+  upload(method, params, field, buffer, filename) {
+    return this.base.upload(method, this.tagged(params), field, buffer, filename);
+  }
+
+  // getMe общего бота одинаков для всех заведений: спрашиваем Telegram один раз
+  async getMe() {
+    return this.base.me || this.base.getMe();
+  }
+
+  sendMessage(chatId, text, extra = {}) {
+    return this.call("sendMessage", { chat_id: chatId, text, ...extra });
+  }
+
+  downloadFile(fileId) {
+    return this.base.downloadFile(fileId);
+  }
+}
+
+module.exports = { TelegramApi, TelegramError, Poller, ALLOWED_UPDATES, TaggedApi, untag, tagMarkup };

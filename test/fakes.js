@@ -47,7 +47,19 @@ class FakeTelegram {
     this.msgId = 1000;
     this.files = {};
     this.updates = {};
-    this.fail = null; // (method, params) → { code, description } — ответить ошибкой Telegram
+    this.fail = null; // (method, params, token) → { code, description } — ответить ошибкой Telegram
+    this.bots = {}; // токен -> ответ getMe (свои боты заведений); без записи — по токену, см. me()
+    this.canManageBots = false; // getMe общего бота: включены ли Managed Bots
+    this.managedTokens = {}; // id управляемого бота -> токен (getManagedBotToken)
+  }
+
+  // Кто этот бот: admin… — бот панели, 123456:… — свой бот заведения с id 123456, остальное — общий бот
+  me(token) {
+    if (this.bots[token]) return this.bots[token];
+    if (token.startsWith("admin")) return { id: 2, is_bot: true, first_name: "Test", username: "test_admin_bot" };
+    const own = token.match(/^(\d+):/);
+    if (own) return { id: Number(own[1]), is_bot: true, first_name: "Venue", username: `venue${own[1]}_bot` };
+    return { id: 1, is_bot: true, first_name: "Test", username: "test_bot", ...(this.canManageBots ? { can_manage_bots: true } : {}) };
   }
 
   async start() {
@@ -71,7 +83,7 @@ class FakeTelegram {
     const token = m[1];
     const method = m[2];
     this.calls.push({ token, method, params, at: Date.now() });
-    const err = this.fail?.(method, params);
+    const err = this.fail?.(method, params, token) || (method === "getManagedBotToken" && !this.managedTokens[params.user_id] ? { code: 400, description: "Bad Request: bot not found" } : null);
     if (err) {
       res.setHeader("content-type", "application/json");
       return res.end(JSON.stringify({ ok: false, error_code: err.code || 400, description: err.description || "Bad Request" }));
@@ -79,7 +91,16 @@ class FakeTelegram {
     let result = true;
     switch (method) {
       case "getMe":
-        result = { id: token.startsWith("admin") ? 2 : 1, is_bot: true, first_name: "Test", username: token.startsWith("admin") ? "test_admin_bot" : "test_bot" };
+        result = this.me(token);
+        break;
+      case "getManagedBotToken":
+        result = this.managedTokens[params.user_id];
+        break;
+      case "getMyDescription":
+        result = { description: "" };
+        break;
+      case "getMyShortDescription":
+        result = { short_description: "" };
         break;
       case "sendMessage":
       case "copyMessage":
@@ -121,6 +142,9 @@ class FakeTelegram {
   reset() {
     this.calls = [];
     this.fail = null;
+    this.bots = {};
+    this.canManageBots = false;
+    this.managedTokens = {};
   }
 
   close() {
@@ -186,8 +210,12 @@ function message(content, stop_reason) {
 const final = (obj) => message([{ type: "text", text: JSON.stringify(obj) }], "end_turn");
 const toolUse = (name, input, id = `tu_${++n}`) => message([{ type: "tool_use", id, name, input }], "tool_use");
 
-function tmpFile() {
-  return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "barber-bot-")), "state.json");
+function tmpDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), "barber-bot-"));
 }
 
-module.exports = { FakeTelegram, FakeAnthropic, final, toolUse, message, tmpFile };
+function tmpFile() {
+  return path.join(tmpDir(), "state.json");
+}
+
+module.exports = { FakeTelegram, FakeAnthropic, final, toolUse, message, tmpFile, tmpDir };
