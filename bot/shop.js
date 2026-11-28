@@ -76,6 +76,9 @@ function emptyShop(prev) {
 const str = (v, max = 300) => (typeof v === "string" ? v.trim().slice(0, max) : "");
 const int = (v, def) => (Number.isFinite(Number(v)) ? Math.round(Number(v)) : def);
 
+// Рабочий день — [открытие, закрытие] в пределах суток. Закрытие в 00:00 — это полночь (24:00),
+// а раньше открытия — работа после полуночи: записываем до 24:00, остаток ночи в сетку дня не помещается.
+// Раньше такие дни молча становились выходными.
 function normHours(raw) {
   const out = {};
   for (const day of WEEKDAY_ORDER) {
@@ -84,15 +87,21 @@ function normHours(raw) {
       const item = raw.find((x) => x && x.day === day);
       v = item && !item.closed ? [item.open, item.close] : null;
     }
-    if (Array.isArray(v) && v.length === 2) {
-      const open = parseTime(v[0]);
-      const close = parseTime(v[1]);
-      out[day] = open != null && close != null && close > open ? [fmtTime(open), fmtTime(close)] : null;
-    } else {
-      out[day] = null;
-    }
+    out[day] = null;
+    if (!Array.isArray(v) || v.length !== 2) continue;
+    const open = parseTime(v[0]);
+    let close = parseTime(v[1]);
+    if (open == null || close == null || open >= 24 * 60) continue;
+    if (close <= open) close = 24 * 60;
+    out[day] = [fmtTime(open), fmtTime(close)];
   }
   return out;
+}
+
+// Известен ли график: хотя бы один рабочий день. «Все дни выходные» у работающей точки не бывает —
+// так выглядят данные, где графика не нашлось, и бот тогда не называет часы и не записывает, а зовёт мастера.
+function hoursKnown(shop) {
+  return WEEKDAY_ORDER.some((day) => shop?.hours?.[day]);
 }
 
 // Сопоставляем новые элементы со старыми по имени, чтобы id не «прыгали».
@@ -212,6 +221,7 @@ const LLM_SHOP_SCHEMA = {
     "services",
     "knowledge",
     "changes",
+    "doubts",
   ],
   properties: {
     name: { type: "string", description: "Название точки" },
@@ -260,7 +270,12 @@ const LLM_SHOP_SCHEMA = {
     changes: {
       type: "array",
       items: { type: "string" },
-      description: "Что изменилось или что стоит проверить мастеру — коротко, по-русски",
+      description: "Что заполнено или изменено — коротко, по-русски",
+    },
+    doubts: {
+      type: "array",
+      items: { type: "string" },
+      description: "Что мастеру стоит проверить: где пришлось догадываться или источник противоречит сам себе — коротко, по-русски",
     },
   },
 };
@@ -314,24 +329,29 @@ function fromLlmShop(obj, base) {
 
 // ---------- Текстовые представления ----------
 
-function hoursLines(shop) {
-  // Склеиваем одинаковые дни подряд: «пн–пт 10:00–21:00»
+// Дни недели подряд с одинаковым значением — одной группой: [{ label: "пн–пт", value }]
+function dayGroups(valueOf) {
   const out = [];
   let i = 0;
   while (i < WEEKDAY_ORDER.length) {
     const day = WEEKDAY_ORDER[i];
-    const h = shop.hours[day];
+    const v = valueOf(day);
     let j = i;
-    while (
-      j + 1 < WEEKDAY_ORDER.length &&
-      JSON.stringify(shop.hours[WEEKDAY_ORDER[j + 1]]) === JSON.stringify(h)
-    )
-      j++;
-    const label = i === j ? DAY_LABEL[day] : `${DAY_LABEL[day]}–${DAY_LABEL[WEEKDAY_ORDER[j]]}`;
-    out.push(`${label}: ${h ? `${h[0]}–${h[1]}` : "выходной"}`);
+    while (j + 1 < WEEKDAY_ORDER.length && JSON.stringify(valueOf(WEEKDAY_ORDER[j + 1])) === JSON.stringify(v)) j++;
+    out.push({ label: i === j ? DAY_LABEL[day] : `${DAY_LABEL[day]}–${DAY_LABEL[WEEKDAY_ORDER[j]]}`, value: v });
     i = j + 1;
   }
   return out;
+}
+
+// «пн–пт: 10:00–21:00», «вс: выходной»
+function hoursLines(shop) {
+  return dayGroups((day) => shop.hours[day] || null).map(({ label, value: h }) => `${label}: ${h ? `${h[0]}–${h[1]}` : "выходной"}`);
+}
+
+// График одной строкой; без единого рабочего дня — «не указан», а не «пн–вс: выходной» (см. hoursKnown)
+function hoursText(shop) {
+  return hoursKnown(shop) ? hoursLines(shop).join("; ") : "не указан";
 }
 
 function serviceLine(shop, s, withId) {
@@ -351,7 +371,11 @@ function renderForPrompt(shop) {
   if (shop.phone) lines.push(`Телефон: ${shop.phone}`);
   if (shop.site) lines.push(`Сайт: ${shop.site}`);
   if (shop.yandexUrl) lines.push(`Яндекс.Карты: ${shop.yandexUrl}`);
-  lines.push(`График работы: ${hoursLines(shop).join("; ")}`);
+  lines.push(
+    hoursKnown(shop)
+      ? `График работы: ${hoursText(shop)}`
+      : "График работы: не указан. Часы работы и свободное время клиенту не называй — по таким вопросам зови мастера."
+  );
   lines.push(
     `Запись: слот ${shop.slotMinutes} мин; записываем минимум за ${fmtDuration(shop.minLeadMinutes || 0)} и не дальше чем на ${shop.bookingDays} дн вперёд.`
   );
@@ -374,7 +398,7 @@ function renderSummary(shop) {
   lines.push(`<b>${esc(shop.name || "Точка без названия")}</b>${shop.demo ? " <i>(демо-данные)</i>" : ""}`);
   if (shop.city || shop.address) lines.push(`📍 ${esc([shop.city, shop.address].filter(Boolean).join(", "))}`);
   if (shop.phone) lines.push(`📞 ${esc(shop.phone)}`);
-  lines.push(`🕐 ${esc(hoursLines(shop).join("; "))}`);
+  lines.push(`🕐 ${hoursKnown(shop) ? esc(hoursText(shop)) : "График не указан"}`);
   lines.push(`✂️ Услуг: ${shop.services.length} · слот ${shop.slotMinutes} мин`);
   lines.push(`👤 Мастера: ${esc(shop.staff.map((s) => s.name).join(", "))}`);
   lines.push(`📚 Заметок-знаний: ${shop.knowledge.length}`);
@@ -420,6 +444,9 @@ module.exports = {
   renderSummary,
   renderFull,
   hoursLines,
+  hoursText,
+  hoursKnown,
+  dayGroups,
   serviceLine,
   findService,
   findStaff,

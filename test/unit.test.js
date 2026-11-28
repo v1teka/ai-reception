@@ -2,10 +2,11 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const { nowParts, addDays, fmtTime, parseTime, minutesUntil } = require("../bot/time");
-const { normalizeShop, demoShop, fromLlmShop, toLlmShop } = require("../bot/shop");
+const { normalizeShop, demoShop, fromLlmShop, toLlmShop, renderForPrompt, renderSummary } = require("../bot/shop");
 const { freeStarts, findFreeSlots, createBooking, cancelBooking, demoBusy } = require("../bot/schedule");
 const { typingDuration, splitReply } = require("../bot/typing");
-const { extractYandexUrl, parseOrgId, htmlToText, looksLikeCaptcha, fetchOrgText } = require("../bot/yandex");
+const { extractYandexUrl, parseOrgId, htmlToText, looksLikeCaptcha, fetchOrgText, parseOpeningHours } = require("../bot/yandex");
+const { reviewShop, collectChecks, checkLines } = require("../bot/review");
 const { buildMessages, replyIndex, stablePrompt, dynamicPrompt } = require("../bot/assistant");
 const { Store } = require("../bot/store");
 const { atMost } = require("../bot/util");
@@ -189,8 +190,114 @@ test("загрузка карточки: в логе и в итоге видны
   assert.equal(ok.ok, true);
   assert.deepEqual(ok.pages.map((p) => p.what), ["Карточка", "Вкладка «Цены»"]);
   assert.equal(ok.pages[1].url, "https://yandex.ru/maps/org/barbershop/1234567890/prices/");
-  assert.equal(log.lines.length, 2);
+  assert.equal(log.lines.length, 3);
   assert.match(log.lines[0], /^info .*maps\/-\/abc → Карточка: HTTP 200, \d+ (?:Б|КБ), итоговый адрес https:\/\/yandex\.ru\/maps\/org\/barbershop\/1234567890\//);
+  assert.match(log.lines[2], /^info Яндекс\.Карты: график в разметке карточки — не найден/);
+});
+
+// Карточка Яндекс.Карт так, как её отдаёт сервер: в тексте страницы — только «Открыто до 22:00» и кнопка
+// «График», а сам график — в разметке schema.org, по тегу на каждый рабочий день (выходных в ней нет)
+const oh = (...rules) => rules.map((r) => `<meta itemProp="openingHours" content="${r}"/>`).join("");
+const yandexCard = ({ title = "Барбершоп Тест, барбершоп, Казань, ул. Ленина, 5 — Яндекс Карты", hours = "" } = {}) =>
+  `<html><head><title>${title}</title></head><body><div itemscope="" itemType="http://schema.org/LocalBusiness">
+<h1 itemProp="name">Барбершоп Тест</h1><div>Казань, ул. Ленина, 5</div><div>+7 (843) 000-11-22</div>
+<div class="business-card-working-status-view__text" title="Открыто до 22:00">Открыто до 22:00</div><div class="card-feature-view__value">График</div>${hours}
+<div>Мужская стрижка</div><div>1 500 ₽</div><div>Оплата картой и наличными</div></div></body></html>`;
+
+test("график с карточки Яндекса — из разметки: выходные, перерыв, до и после полуночи, общий вид schema.org", () => {
+  const card = parseOpeningHours(yandexCard({ hours: oh("Mo 10:00-21:00", "Tu 10:00-21:00", "We 10:00-21:00", "Th 10:00-21:00", "Fr 10:00-21:00", "Sa 11:00-20:00") }));
+  const weekdays = ["10:00", "21:00"];
+  assert.deepEqual(card.hours, { mon: weekdays, tue: weekdays, wed: weekdays, thu: weekdays, fri: weekdays, sat: ["11:00", "20:00"], sun: null });
+  assert.equal(card.line, "пн–пт: 10:00–21:00; сб: 11:00–20:00; вс: выходной");
+  assert.deepEqual(card.notes, []);
+
+  // Перерыв: у бота на день один промежуток — от открытия до закрытия, а перерыв уходит администратору на проверку
+  const post = parseOpeningHours(oh("Tu 11:00-14:00,15:00-19:00", "We 11:00-14:00,15:00-19:00"));
+  assert.deepEqual(post.hours.tue, ["11:00", "19:00"]);
+  assert.equal(post.hours.mon, null);
+  assert.match(post.line, /перерыв вт–ср 14:00–15:00/);
+  assert.equal(post.notes.length, 1);
+  assert.match(post.notes[0].text, /перерыв: вт–ср 14:00–15:00/);
+
+  // До полуночи и после неё — рабочий день до 24:00, а не выходной
+  const night = parseOpeningHours(oh("Fr 12:00-00:00", "Sa 12:00-06:00"));
+  assert.deepEqual([night.hours.fri, night.hours.sat], [["12:00", "24:00"], ["12:00", "24:00"]]);
+  assert.equal(night.notes.length, 1);
+  assert.match(night.notes[0].text, /сб до 06:00\. Бот записывает только до 24:00/);
+
+  // Общий вид schema.org: диапазоны и списки дней, «Mo-Su» без времени — круглосуточно, атрибуты в любом порядке
+  assert.equal(parseOpeningHours(oh("Mo-Fr 09:00-21:00", "Sa,Su 10:00-18:00")).line, "пн–пт: 09:00–21:00; сб–вс: 10:00–18:00");
+  assert.equal(parseOpeningHours(oh("Mo-Su")).line, "пн–вс: 00:00–24:00");
+  assert.deepEqual(parseOpeningHours('<meta content="We 10:00-12:00" itemprop="openingHours">').hours.wed, ["10:00", "12:00"]);
+
+  // Графика в разметке нет — null («не знаем»), а не «все дни выходные»
+  assert.equal(parseOpeningHours(yandexCard()), null);
+  assert.equal(parseOpeningHours(oh("по договорённости")), null);
+});
+
+test("загрузка карточки: график из разметки — первой строкой текста для ИИ и в hours; закрытая организация — в проверках", async () => {
+  const fetchFrom = (html, finalUrl) => async (url) => ({ status: 200, url: /prices/.test(url) ? url : finalUrl, text: async () => html });
+  const r = await fetchOrgText("https://yandex.ru/maps/-/abc", {
+    fetchImpl: fetchFrom(yandexCard({ hours: oh("Mo-Fr 10:00-21:00") }), "https://yandex.ru/maps/org/barbershop/1234567890/"),
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.text.split("\n")[0], "График работы (из разметки карточки): пн–пт: 10:00–21:00; сб–вс: выходной");
+  assert.deepEqual([r.hours.mon, r.hours.sat], [["10:00", "21:00"], null]);
+  assert.deepEqual(r.checks, []);
+
+  const gone = await fetchOrgText("https://yandex.ru/maps/org/barber/1234567890/", {
+    fetchImpl: fetchFrom(yandexCard({ title: "Больше не работает: Барбер, барбершоп, Москва — Яндекс Карты" }), "https://yandex.ru/maps/org/barber/1234567890/"),
+  });
+  assert.equal(gone.ok, true);
+  assert.equal(gone.hours, null);
+  assert.deepEqual(gone.checks.map((c) => c.level), ["error"]);
+  assert.match(gone.checks[0].text, /больше не работает/);
+});
+
+test("график: закрытие в полночь и после неё — рабочий день до 24:00, а не выходной", () => {
+  const shop = normalizeShop({
+    hours: [
+      { day: "mon", closed: false, open: "10:00", close: "00:00" },
+      { day: "tue", closed: false, open: "12:00", close: "02:00" },
+      { day: "wed", closed: false, open: "00:00", close: "00:00" },
+      { day: "thu", closed: false, open: "10:00", close: "" },
+      { day: "fri", closed: true, open: "10:00", close: "20:00" },
+    ],
+  });
+  assert.deepEqual(shop.hours, { mon: ["10:00", "24:00"], tue: ["12:00", "24:00"], wed: ["00:00", "24:00"], thu: null, fri: null, sat: null, sun: null });
+});
+
+test("проверка данных точки: без графика и услуг бот работать не сможет, без цен и имён мастеров — сомнительно", () => {
+  assert.deepEqual(reviewShop(demoShop()), []);
+  const empty = normalizeShop({ name: "Пусто" });
+  const checks = reviewShop(empty);
+  assert.deepEqual(checks.map((c) => c.level), ["error", "error", "warn"]);
+  assert.match(checks[0].text, /График работы не указан/);
+  assert.match(checks[1].text, /ни одной услуги/);
+  assert.match(checks[2].text, /Имена мастеров не указаны/);
+
+  const noPrice = shopFixture({ services: [{ name: "Стрижка", price: "", slots: 2 }, { name: "Борода", price: "900 ₽", slots: 1 }] });
+  assert.deepEqual(reviewShop(noPrice).map((c) => c.text), ["Без цены: «Стрижка» — стоимость бот не назовёт."]);
+  const manyNoPrice = shopFixture({ services: ["А", "Б", "В", "Г"].map((name) => ({ name, price: "", slots: 1 })) });
+  assert.equal(reviewShop(manyNoPrice)[0].text, "Нет цены у 4 услуг из 4 — стоимость бот не назовёт.");
+
+  // Одним списком: сначала то, что ломает работу бота, без повторов; сомнения ИИ — как есть
+  const all = collectChecks({ shop: empty, notes: [{ level: "warn", text: "В карточке перерыв" }], doubts: ["Длительность угадана", " ", "Длительность угадана"] });
+  assert.deepEqual(all.map((c) => c.level), ["error", "error", "warn", "warn", "warn"]);
+  assert.deepEqual(all.slice(2).map((c) => c.text), ["В карточке перерыв", checks[2].text, "Длительность угадана"]);
+  assert.deepEqual(checkLines([{ level: "error", text: "a <b>" }, { level: "warn", text: "c" }]), ["❗ a &lt;b&gt;", "• c"]);
+});
+
+test("без графика бот не называет время и не записывает, а зовёт мастера; в подсказке ИИ — «не указан», а не «выходной»", () => {
+  const shop = shopFixture({ hours: {} });
+  assert.match(findFreeSlots(emptyState(), shop, { serviceId: "s1", now: NOW }).error, /График работы точки не указан/);
+  const r = createBooking(emptyState(), shop, { serviceId: "s1", date: "2026-11-06", time: "12:00", client: { key: "x" }, now: NOW });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /позови мастера/);
+  const prompt = renderForPrompt(shop);
+  assert.match(prompt, /График работы: не указан/);
+  assert.doesNotMatch(prompt, /выходной/);
+  assert.match(renderSummary(shop), /🕐 График не указан/);
 });
 
 test("точка: слоты из длительности, стабильные id, формат для ИИ туда-обратно", () => {

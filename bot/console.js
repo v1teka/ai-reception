@@ -3,9 +3,10 @@
 const { esc, truncate, oneLine, randomCode, userName, atMost } = require("./util");
 const { nowParts, fmtTime, fmtDate, fmtDateRelative, addDays, ago } = require("./time");
 const { upcomingBookings, bookingLabel, cancelBooking, freeStarts } = require("./schedule");
-const { renderSummary, renderFull, demoShop, emptyShop, serviceLine } = require("./shop");
+const { renderSummary, renderFull, demoShop, emptyShop, serviceLine, hoursKnown } = require("./shop");
 const { importFromYandex, updateFromMessage, noteFromImages } = require("./setup");
 const { extractYandexUrl } = require("./yandex");
+const { reviewShop, checkLines } = require("./review");
 
 const DAY = 86400000;
 const SETUP_FRESH_MS = 15 * 60 * 1000;
@@ -271,6 +272,10 @@ const methods = {
     const shop = this.shop;
     const today = nowParts(shop.timezone, this.now()).date;
     const lines = [`🕐 <b>Свободное время</b> (слот ${shop.slotMinutes} мин)`];
+    if (!hoursKnown(shop)) {
+      lines.push("", "График работы не указан — бот не записывает клиентов. Укажите график в «Настройках точки».");
+      return this.show(adminId, lines.join("\n"), [BACK], cq);
+    }
     for (const date of [today, addDays(today, 1)]) {
       lines.push("", `<b>${esc(fmtDateRelative(date, today))}</b>`);
       for (const st of shop.staff) {
@@ -305,10 +310,13 @@ const methods = {
 
   async showSettings(adminId, cq) {
     const s = this.shop;
+    // Здесь — только то, без чего бот не работает (нет графика, нет услуг): остальное показано при загрузке и правке
+    const broken = s.demo ? [] : reviewShop(s).filter((c) => c.level === "error");
     const lines = [
       "⚙️ <b>Настройки точки</b>",
       "",
       renderSummary(s),
+      ...(broken.length ? ["", ...checkLines(broken)] : []),
       "",
       "Загрузите свою точку с Яндекс.Карт или нажмите «Изменить словами или фото» и напишите, что изменить: услуги, цены, график, любые факты для ответов клиентам.",
     ];
@@ -342,10 +350,13 @@ const methods = {
     return this.show(adminId, chunks(lines.join("\n"), 3900 - tail.length)[0] + tail, kb, cq);
   },
 
-  async showPreview(adminId, shop, changes) {
-    const lines = ["👀 <b>Проверьте, что получилось</b>", "", renderFull(shop)];
+  // checks — что бот просит проверить (review.js): сверху, до данных, чтобы не потерялось в длинном прайсе
+  async showPreview(adminId, shop, changes, checks = reviewShop(shop)) {
+    const lines = ["👀 <b>Проверьте, что получилось</b>", ""];
+    if (checks.length) lines.push("⚠️ <b>Обратите внимание</b>", ...checkLines(checks), "");
+    lines.push(renderFull(shop));
     if (changes?.length) {
-      lines.push("", "<b>На что обратить внимание</b>");
+      lines.push("", "📝 <b>Что сделано</b>");
       for (const c of changes.slice(0, 15)) lines.push(`• ${esc(c)}`);
     }
     const kb = [[btn("✅ Сохранить", "s:save"), btn("❌ Отменить", "s:cancel")]];
@@ -512,7 +523,7 @@ const methods = {
         );
       }
       this.setMode(a, "review", { pending: r.shop, freshBase: false });
-      return this.showPreview(adminId, r.shop, r.changes);
+      return this.showPreview(adminId, r.shop, r.changes, r.checks);
     }
 
     const base = a.pending || (a.freshBase && this.shop.demo ? emptyShop(this.shop) : this.shop);
@@ -525,7 +536,7 @@ const methods = {
       ]);
     }
     this.setMode(a, "review", { pending: r.shop, freshBase: false });
-    return this.showPreview(adminId, r.shop, r.changes);
+    return this.showPreview(adminId, r.shop, r.changes, r.checks);
   },
 
   async onSettingsAction(adminId, act, arg, cq) {
@@ -660,9 +671,12 @@ const methods = {
       await this.notifyAdmin(o.id, `👤 ${esc(userName(user))} принял приглашение и стал мастером.${note}`);
     }
     if (ready) {
+      // Администратор точки знает её лучше всех: что бот просит проверить — сразу ему
+      const checks = reviewShop(this.shop);
+      const review = checks.length ? `\n\n⚠️ <b>Обратите внимание</b>\n${checkLines(checks).join("\n")}` : "";
       return this.sendHtml(
         user.id,
-        `Добро пожаловать, ${esc(user.first_name || "мастер")}! 💈\n\nЯ онлайн-администратор <b>${esc(this.shop.name)}</b>: отвечаю клиентам 24/7, показываю свободное время и записываю. Если я не уверен или что-то сломалось — сразу зову вас.\n\n<b>Данные вашей точки уже загружены:</b>\n${renderSummary(this.shop)}\n\nПроверьте их: если что-то не так, откройте «Настройки точки» и напишите, что поправить, — словами или фото прайса.`,
+        `Добро пожаловать, ${esc(user.first_name || "мастер")}! 💈\n\nЯ онлайн-администратор <b>${esc(this.shop.name)}</b>: отвечаю клиентам 24/7, показываю свободное время и записываю. Если я не уверен или что-то сломалось — сразу зову вас.\n\n<b>Данные вашей точки уже загружены:</b>\n${renderSummary(this.shop)}${review}\n\nПроверьте их: если что-то не так, откройте «Настройки точки» и напишите, что поправить, — словами или фото прайса.`,
         { reply_markup: { inline_keyboard: [[btn("⚙️ Настройки точки", "m:settings"), btn("💈 Меню", "m:panel")]] } }
       );
     }

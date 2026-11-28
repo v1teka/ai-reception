@@ -6,6 +6,7 @@ const fs = require("fs");
 const net = require("net");
 const { renderFull } = require("./shop");
 const { parseVenueData } = require("./platform");
+const { checkLines } = require("./review");
 const { plain } = require("./util");
 
 const MAX_REQUEST = 1024 * 1024;
@@ -32,9 +33,10 @@ function need(p, ref) {
 }
 
 // Заведение создано командой: ссылки для клиентов и администратора — в ответ, а владельцам ещё и в Telegram
-async function created(p, rec, app, { notes = [], quiet = false } = {}) {
+// checks — что бот просит проверить (review.js); в --json ещё и notes — те же тексты строками, как раньше
+async function created(p, rec, app, { checks = [], quiet = false } = {}) {
   const invite = p.adminInvite(rec.id, null);
-  if (!quiet) await p.announceVenue(rec, app, { notes, via: "команда на сервере", invite }).catch((e) => p.log.warn("Владельцам:", e.message));
+  if (!quiet) await p.announceVenue(rec, app, { checks, via: "команда на сервере", invite }).catch((e) => p.log.warn("Владельцам:", e.message));
   const d = p.describe(rec);
   const text = [
     `Заведение создано: ${d.id} · ${d.name}`,
@@ -43,10 +45,10 @@ async function created(p, rec, app, { notes = [], quiet = false } = {}) {
     "",
     `Ссылка для клиентов: ${d.clientLink}`,
     `Ссылка для администратора (одноразовая, 7 дней): ${invite}`,
-    ...(notes.length ? ["", "Проверьте:", ...notes.map((n) => `• ${n}`)] : []),
+    ...(checks.length ? ["", "Проверьте:", ...checkLines(checks, { html: false })] : []),
     ...(quiet || !p.ownerIds().length ? [] : ["", "Те же ссылки отправлены владельцу в Telegram."]),
   ];
-  return { result: { venue: d, invite, notes }, text: text.join("\n") };
+  return { result: { venue: d, invite, checks, notes: checks.map((c) => c.text) }, text: text.join("\n") };
 }
 
 const COMMANDS = {
@@ -91,12 +93,12 @@ const COMMANDS = {
     if (opts.data) {
       const seed = parseVenueData(opts.data);
       const { rec, app } = await p.createVenue({ shop: seed.shop, slug: slug || seed.slug, by: "cli" });
-      return created(p, rec, app, { notes: seed.notes, quiet: opts.quiet });
+      return created(p, rec, app, { checks: seed.checks, quiet: opts.quiet });
     }
     if (!url) throw new Error("Нужна ссылка на карточку в Яндекс.Картах или --json с данными заведения");
     const r = await p.importVenue({ url, slug, by: "cli" });
     if (!r.ok) throw new Error([`Не получилось загрузить карточку: ${r.reason || "причина неизвестна"}`, ...(r.details || []).map((d) => `• ${d}`)].join("\n"));
-    return created(p, r.rec, r.app, { notes: r.changes, quiet: opts.quiet });
+    return created(p, r.rec, r.app, { checks: r.checks, quiet: opts.quiet });
   },
 
   invite(p, [ref]) {
