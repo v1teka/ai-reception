@@ -87,7 +87,7 @@ const COMMANDS = {
     return { result: { ...d, shop: app.shop }, text: [...venueLines(p, d), "", plain(renderFull(app.shop))].join("\n") };
   },
 
-  // add <ссылка на Яндекс.Карты> | add --json <данные> — новое заведение. --slug — своя ссылка, --quiet — не писать владельцам
+  // add <ссылка на Яндекс.Карты или 2ГИС> | add --json <данные> — новое заведение. --slug — своя ссылка, --quiet — не писать владельцам
   async add(p, [url], opts) {
     const slug = opts.slug || null;
     if (opts.data) {
@@ -95,7 +95,7 @@ const COMMANDS = {
       const { rec, app } = await p.createVenue({ shop: seed.shop, slug: slug || seed.slug, by: "cli" });
       return created(p, rec, app, { checks: seed.checks, quiet: opts.quiet });
     }
-    if (!url) throw new Error("Нужна ссылка на карточку в Яндекс.Картах или --json с данными заведения");
+    if (!url) throw new Error("Нужна ссылка на карточку в Яндекс.Картах или 2ГИС или --json с данными заведения");
     const r = await p.importVenue({ url, slug, by: "cli" });
     if (!r.ok) throw new Error([`Не получилось загрузить карточку: ${r.reason || "причина неизвестна"}`, ...(r.details || []).map((d) => `• ${d}`)].join("\n"));
     return created(p, r.rec, r.app, { checks: r.checks, quiet: opts.quiet });

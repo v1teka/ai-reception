@@ -1,8 +1,8 @@
-// Экраны владельца платформы в общем боте: список заведений, новое заведение по карточке с Яндекс.Карт,
+// Экраны владельца платформы в общем боте: список заведений, новое заведение по карточке в Яндекс.Картах или 2ГИС,
 // ссылки для клиентов и администратора, администраторы, свой бот у заведения. Кнопки — «P:…» (см. onOwnerCallback).
 const { App } = require("./app");
 const { renderSummary, emptyShop } = require("./shop");
-const { extractYandexUrl } = require("./yandex");
+const { extractMapUrl, mapOf } = require("./maps");
 const { checkLines, hasErrors } = require("./review");
 const { esc, truncate } = require("./util");
 
@@ -40,7 +40,7 @@ const methods = {
       await this.showVenues(uid, api);
       return true;
     }
-    const url = extractYandexUrl(m[2] || "");
+    const url = extractMapUrl(m[2] || "");
     if (url) {
       this.setMode(uid, null);
       this.run(() => this.createFromUrl(uid, url, api));
@@ -64,7 +64,7 @@ const methods = {
       return false;
     }
     if (mode === "await_venue") {
-      const url = extractYandexUrl(text);
+      const url = extractMapUrl(text);
       if (url) {
         this.setMode(uid, null);
         this.run(() => this.createFromUrl(uid, url, api));
@@ -76,7 +76,7 @@ const methods = {
         await this.createEmpty(uid, api, { forward: { u, source } });
         return true;
       }
-      await this.sendHtml(api, uid, "Пришлите ссылку на карточку заведения в Яндекс.Картах — или скриншоты карточки и прайса, или описание словами.", [
+      await this.sendHtml(api, uid, "Пришлите ссылку на карточку заведения в Яндекс.Картах или 2ГИС — или скриншоты карточки и прайса, или описание словами.", [
         [this.btn("📝 Создать пустое", "empty"), this.btn("❌ Отмена", "cancel")],
       ]);
       return true;
@@ -110,13 +110,13 @@ const methods = {
     return this.sendHtml(
       api,
       uid,
-      "➕ <b>Новое заведение</b>\n\nПришлите ссылку на карточку заведения в Яндекс.Картах (в приложении: карточка → «Поделиться» → «Скопировать ссылку»). Бот заберёт название, адрес, график, телефон и прайс, создаст заведение и даст ссылки для клиентов и администратора.\n\nНет карточки или Яндекс не пускает — пришлите скриншоты карточки и прайса или опишите заведение словами.",
+      "➕ <b>Новое заведение</b>\n\nПришлите ссылку на карточку заведения в Яндекс.Картах или 2ГИС (в приложении: карточка → «Поделиться» → «Скопировать ссылку»). Бот заберёт название, адрес, график, телефон и прайс, создаст заведение и даст ссылки для клиентов и администратора.\n\nНет карточки или карты не пускают — пришлите скриншоты карточки и прайса или опишите заведение словами.",
       [[this.btn("📝 Создать пустое", "empty"), this.btn("❌ Отмена", "cancel")]]
     );
   },
 
   async createFromUrl(uid, url, api) {
-    await api.sendMessage(uid, "⏳ Загружаю карточку с Яндекс.Карт и создаю заведение… Обычно это до минуты.").catch(() => {});
+    await api.sendMessage(uid, `⏳ Загружаю карточку ${mapOf(url)?.from || "с карт"} и создаю заведение… Обычно это до минуты.`).catch(() => {});
     const r = await this.importVenue({ url, by: uid });
     if (!r.ok) {
       // Владелец видит техническую причину целиком: он и разбирается со сбоями
@@ -197,7 +197,7 @@ const methods = {
       lines.push(`${rec.id === cur ? "▶️" : "•"} <b>${esc(d.name)}</b>${d.default ? " · основное" : ""} · ${bot} · ${admins}`);
     }
     if (list.length > 40) lines.push(`…и ещё ${list.length - 40}: полный список — node bot/cli.js list на сервере`);
-    lines.push("", "<i>Новое заведение — кнопка ниже или команда /new со ссылкой на карточку в Яндекс.Картах.</i>");
+    lines.push("", "<i>Новое заведение — кнопка ниже или команда /new со ссылкой на карточку в Яндекс.Картах или 2ГИС.</i>");
     const kb = list.slice(0, 40).map((rec) => [this.btn(`${rec.id === cur ? "▶️ " : ""}${truncate(this.venueName(rec.id), 40)}`, `v:${rec.id}`)]);
     kb.push([this.btn("➕ Новое заведение", "new")]);
     return this.ownerShow(api, uid, lines.join("\n"), kb, cq);

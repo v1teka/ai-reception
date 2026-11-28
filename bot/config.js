@@ -26,7 +26,7 @@ function loadConfig(env = process.env) {
     effort: env.ANTHROPIC_EFFORT || "high", // чат: качество ответа важнее скорости; low — быстрее и дешевле
     setupEffort: env.ANTHROPIC_SETUP_EFFORT || "medium", // разбор карточки и прайса
     fallbacks: !off(env.ANTHROPIC_FALLBACKS),
-    yandexWebFetch: !off(env.YANDEX_WEB_FETCH),
+    yandexWebFetch: !off(env.YANDEX_WEB_FETCH), // запасной путь импорта: ИИ сам открывает карточку (и Яндекс.Карт, и 2ГИС)
 
     llmTimeoutMs: num(env.LLM_TIMEOUT_MS, 30000),
     setupTimeoutMs: num(env.SETUP_TIMEOUT_MS, 120000),

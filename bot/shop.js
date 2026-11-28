@@ -1,6 +1,6 @@
 // Точка (барбершоп) — это данные, а не код. Их меняет мастер прямо в Telegram:
-// импорт с Яндекс.Карт, правки словами, заметки-«знания».
-const { WEEKDAY_ORDER, WEEKDAY_SHORT, parseTime, fmtTime, fmtDuration } = require("./time");
+// импорт по ссылке на карты (Яндекс.Карты, 2ГИС), правки словами, заметки-«знания».
+const { WEEKDAY_ORDER, WEEKDAY_SHORT, parseTime, fmtTime, fmtDuration, zoneOffset, fmtUtcOffset } = require("./time");
 const { esc, clamp, truncate } = require("./util");
 
 const DAY_LABEL = WEEKDAY_SHORT;
@@ -15,7 +15,7 @@ function demoShop() {
     address: "ул. Примерная, 1 (демо-адрес)",
     phone: "+7 (900) 000-00-00",
     site: "",
-    yandexUrl: "",
+    mapUrl: "",
     description: "Мужские стрижки, оформление бороды, королевское бритьё. Уютно, кофе за счёт заведения.",
     timezone: "Europe/Moscow",
     slotMinutes: 30,
@@ -188,7 +188,8 @@ function normalizeShop(raw, prev) {
     address: str(raw.address, 300),
     phone: str(raw.phone, 80),
     site: str(raw.site, 200),
-    yandexUrl: str(raw.yandexUrl, 500),
+    // Ссылка на карточку в Яндекс.Картах или 2ГИС; в данных, сохранённых до 2ГИС, она лежит в yandexUrl
+    mapUrl: str(raw.mapUrl || raw.yandexUrl, 500),
     description: str(raw.description, 1000),
     greeting: str(raw.greeting, 500),
     timezone: str(raw.timezone, 60) || "Europe/Moscow",
@@ -370,7 +371,7 @@ function renderForPrompt(shop) {
   if (shop.city || shop.address) lines.push(`Адрес: ${[shop.city, shop.address].filter(Boolean).join(", ")}`);
   if (shop.phone) lines.push(`Телефон: ${shop.phone}`);
   if (shop.site) lines.push(`Сайт: ${shop.site}`);
-  if (shop.yandexUrl) lines.push(`Яндекс.Карты: ${shop.yandexUrl}`);
+  if (shop.mapUrl) lines.push(`Карточка на картах: ${shop.mapUrl}`);
   lines.push(
     hoursKnown(shop)
       ? `График работы: ${hoursText(shop)}`
@@ -411,7 +412,9 @@ function renderFull(shop) {
   const lines = [renderSummary(shop), ""];
   if (shop.description) lines.push(esc(shop.description), "");
   if (shop.site) lines.push(`🌐 ${esc(shop.site)}`);
-  if (shop.yandexUrl) lines.push(`🗺 ${esc(shop.yandexUrl)}`);
+  if (shop.mapUrl) lines.push(`🗺 ${esc(shop.mapUrl)}`);
+  const offset = zoneOffset(shop.timezone);
+  lines.push(`🌍 Часовой пояс: ${esc(shop.timezone)}${offset == null ? "" : ` (${fmtUtcOffset(offset)})`}`);
   lines.push("<b>Услуги</b>");
   for (const s of shop.services) lines.push(`• ${esc(serviceLine(shop, s, false))}`);
   if (!shop.services.length) lines.push("— пока нет");

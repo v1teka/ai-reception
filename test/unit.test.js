@@ -1,11 +1,15 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { nowParts, addDays, fmtTime, parseTime, minutesUntil } = require("../bot/time");
+const { nowParts, addDays, fmtTime, parseTime, minutesUntil, fmtUtcOffset } = require("../bot/time");
 const { normalizeShop, demoShop, fromLlmShop, toLlmShop, renderForPrompt, renderSummary } = require("../bot/shop");
 const { freeStarts, findFreeSlots, createBooking, cancelBooking, demoBusy } = require("../bot/schedule");
 const { typingDuration, splitReply } = require("../bot/typing");
-const { extractYandexUrl, parseOrgId, htmlToText, looksLikeCaptcha, fetchOrgText, parseOpeningHours } = require("../bot/yandex");
+const { extractYandexUrl, parseOrgId, looksLikeCaptcha, fetchOrgText, parseOpeningHours, pageTimezone } = require("../bot/yandex");
+const { htmlToText, zoneForOffset } = require("../bot/cards");
+const { extract2gisUrl, parseFirmId, fetch2gisCard, chromeVersion } = require("../bot/2gis");
+const { findMapLink, mapOf } = require("../bot/maps");
+const dgis = require("./2gis-pages");
 const { reviewShop, collectChecks, checkLines } = require("../bot/review");
 const { buildMessages, replyIndex, stablePrompt, dynamicPrompt } = require("../bot/assistant");
 const { Store } = require("../bot/store");
@@ -241,7 +245,7 @@ test("загрузка карточки: график из разметки — 
     fetchImpl: fetchFrom(yandexCard({ hours: oh("Mo-Fr 10:00-21:00") }), "https://yandex.ru/maps/org/barbershop/1234567890/"),
   });
   assert.equal(r.ok, true);
-  assert.equal(r.text.split("\n")[0], "График работы (из разметки карточки): пн–пт: 10:00–21:00; сб–вс: выходной");
+  assert.equal(r.text.split("\n")[0], "График работы (из данных карточки): пн–пт: 10:00–21:00; сб–вс: выходной");
   assert.deepEqual([r.hours.mon, r.hours.sat], [["10:00", "21:00"], null]);
   assert.deepEqual(r.checks, []);
 
@@ -265,6 +269,131 @@ test("график: закрытие в полночь и после неё — 
     ],
   });
   assert.deepEqual(shop.hours, { mon: ["10:00", "24:00"], tue: ["12:00", "24:00"], wed: ["00:00", "24:00"], thu: null, fri: null, sat: null, sun: null });
+});
+
+test("ссылки 2ГИС: карточка, поиск, короткая ссылка; чьи это карты, бот видит по ссылке сам", () => {
+  assert.equal(extract2gisUrl("наша точка https://2gis.kz/almaty/firm/70000001090275785/76.9,43.2, ждём"), "https://2gis.kz/almaty/firm/70000001090275785/76.9,43.2");
+  assert.equal(extract2gisUrl("https://go.2gis.com/AbC12"), "https://go.2gis.com/AbC12");
+  assert.equal(extract2gisUrl("https://2gis.com.cy/limassol/firm/70000001000000002"), "https://2gis.com.cy/limassol/firm/70000001000000002");
+  assert.equal(parseFirmId("https://2gis.ru/moscow/search/барбершоп/firm/70000001043775090/37.6,55.7"), "70000001043775090");
+  assert.equal(parseFirmId("https://2gis.ru/moscow/firm/70000001043775090/tab/prices"), "70000001043775090");
+  assert.equal(parseFirmId("https://2gis.kz/almaty/geo/9430047374978587"), null);
+  assert.equal(extract2gisUrl("https://2gis.ru.evil.example/moscow/firm/70000001043775090"), null);
+  assert.equal(extract2gisUrl("https://my2gis.ru/moscow/firm/70000001043775090"), null);
+  assert.equal(extract2gisUrl("ищите нас в 2gis.ru"), null);
+
+  // В сообщении ссылки на разные карты — бот берёт первую и сам понимает, чьи это карты
+  const both = findMapLink("в 2ГИС https://2gis.kz/almaty/firm/1234567 или https://yandex.kz/maps/org/x/123456/");
+  assert.deepEqual([both.map.id, both.url], ["2gis", "https://2gis.kz/almaty/firm/1234567"]);
+  assert.equal(findMapLink("https://yandex.kz/maps/org/x/123456/ и https://2gis.kz/almaty/firm/1234567").map.id, "yandex");
+  assert.equal(mapOf("https://yandex.ru/maps/-/CDb~aBcD").name, "Яндекс.Карты");
+  assert.equal(mapOf("https://go.2gis.com/AbC12").name, "2ГИС");
+  assert.equal(mapOf("https://example.com/maps/org/1/"), null);
+
+  // Старые браузеры 2ГИС отправляет на заглушку: версия Chrome в User-Agent растёт с датой
+  assert.equal(chromeVersion(Date.parse("2026-11-28T00:00:00Z")), 155);
+  assert.ok(chromeVersion(Date.parse("2027-11-28T00:00:00Z")) >= 168);
+});
+
+test("карточка 2ГИС: всё из состояния страницы — график с перерывом и ночью, прайс по разделам, часовой пояс", async () => {
+  const log = logSpy();
+  const r = await fetch2gisCard("https://go.2gis.com/abc", { log, fetchImpl: dgis.fake2gisFetch() });
+  assert.equal(r.ok, true);
+  assert.equal(r.url, dgis.FIRM_URL, "адрес карточки без координат и поиска");
+  assert.equal(r.orgId, dgis.FIRM_ID);
+  assert.deepEqual(r.pages.map((p) => [p.what, p.url]), [["Карточка", "https://go.2gis.com/abc"], ["Вкладка «Цены»", `${dgis.FIRM_URL}/tab/prices`]]);
+  assert.equal(r.timezone, "Asia/Almaty");
+  const weekdays = ["10:00", "21:00"];
+  assert.deepEqual(r.hours, { mon: weekdays, tue: weekdays, wed: weekdays, thu: weekdays, fri: weekdays, sat: ["11:00", "24:00"], sun: null });
+
+  const lines = r.text.split("\n");
+  assert.equal(lines[0], "График работы (из данных карточки): пн–пт: 10:00–21:00; сб: 11:00–24:00; вс: выходной; перерыв пн–пт 14:00–15:00; после полуночи сб до 02:00");
+  for (const line of [
+    "Название: Барбершоп Тест",
+    "Вид деятельности: барбершоп, Барбершопы",
+    "Город: Алматы",
+    "Адрес: проспект Абая, 1 (1 этаж)",
+    "Телефон: +7‒700‒000‒11‒22",
+    "Сайт: http://barbershop-test.kz",
+    "WhatsApp: https://wa.me/77000001122",
+    "- Способы оплаты: Оплата картой, Оплата по QR-коду",
+  ]) {
+    assert.ok(lines.includes(line), `в тексте для ИИ нет строки «${line}»:\n${r.text}`);
+  }
+  assert.doesNotMatch(r.text, /link\.2gis\.ru|Подтверждённый рейтинг|Откроется в 10:00/, "ни переадресации 2ГИС, ни сведений о самой карточке, ни «Откроется в…»");
+  assert.match(r.text, /\n\n=== Вкладка «Цены» ===\nСтрижки:\n- Мужская стрижка — 5 000 ₸\. Мытьё головы и укладка\n- Детская стрижка — 3 500–5 000 ₸\nБорода:\n- Моделирование бороды — 3 000 ₸\n- Консультация — цена не указана$/);
+
+  // Перерыв и работа после полуночи в расписание бота не помещаются — на проверку администратору
+  assert.deepEqual(r.checks.map((c) => c.level), ["warn", "warn"]);
+  assert.match(r.checks[0].text, /^В карточке перерыв: пн–пт 14:00–15:00\./);
+  assert.match(r.checks[1].text, /после полуночи работают: сб до 02:00/);
+  assert.equal(log.lines.length, 3);
+  assert.match(log.lines[0], /^info 2ГИС: https:\/\/go\.2gis\.com\/abc → Карточка: HTTP 200, \d+ КБ, итоговый адрес https:\/\/2gis\.kz\/almaty\/firm\/70000001000000001$/);
+  assert.match(log.lines[2], /^info 2ГИС: график в данных карточки — пн–пт: 10:00–21:00/);
+});
+
+test("карточка 2ГИС: что проверить — закрыта, временно закрыта, данные не подтверждены, прайс не целиком", async () => {
+  const load = (over, prices) => fetch2gisCard(dgis.FIRM_URL, { fetchImpl: dgis.fake2gisFetch({ card: dgis.cardHtml(dgis.firm(over)), prices }) });
+  const texts = (r) => r.checks.map((c) => `${c.level}: ${c.text}`);
+
+  const gone = await load({ dates: { deleted_at: "2026-05-01T00:00:00Z" } });
+  assert.match(texts(gone)[0], /^error: 2ГИС пишет, что организация больше не работает/);
+  assert.match(texts(await load({ flags: { temporary_closed: true } }))[0], /^warn: 2ГИС пишет, что организация временно не работает/);
+  assert.match(texts(await load({ flags: { temporary_closed: "opening_soon" } }))[0], /^warn: 2ГИС пишет, что организация скоро откроется/);
+
+  const unsure = await load({ attribute_groups: [dgis.NOT_CONFIRMED], schedule: {} }, dgis.pricesHtml(dgis.PRICES, { total: 69 }));
+  assert.deepEqual(texts(unsure), [
+    "warn: 2ГИС пишет: «Актуальность данных не подтверждена» — сверьте адрес, телефон, график и цены.",
+    "warn: В прайсе 2ГИС позиций: 69, загрузились первые 4. Проверьте, все ли услуги на месте.",
+  ]);
+  assert.match(unsure.text, /=== Вкладка «Цены» \(первые 4 из 69\) ===/);
+  assert.doesNotMatch(unsure.text, /Актуальность данных/, "это о карточке, а не о точке: в «знания» ИИ не уйдёт");
+  // Графика в карточке нет — null («не знаем»), а не «все дни выходные»
+  assert.equal(unsure.hours, null);
+  assert.doesNotMatch(unsure.text, /График работы/);
+});
+
+test("карточка 2ГИС не загрузилась: заглушка «браузер устарел», 404, ссылка не на организацию; без состояния — видимый текст", async () => {
+  const museum = await fetch2gisCard(dgis.FIRM_URL, {
+    fetchImpl: async (url) => ({ status: 200, url: `https://2gis.kz/museum?return_url=${encodeURIComponent(url)}`, text: async () => "<html>Ваш браузер устарел</html>" }),
+  });
+  assert.equal(museum.ok, false);
+  assert.match(museum.reason, /заглушку «Ваш браузер устарел»/);
+  assert.equal(museum.pages[0].blocked, "заглушка «браузер устарел»");
+
+  const missing = await fetch2gisCard(dgis.FIRM_URL, {
+    fetchImpl: async (url) => ({ status: 404, url, text: async () => "<html><title>2ГИС</title></html>" }),
+  });
+  assert.equal(missing.reason, "2ГИС не нашёл такую организацию: проверьте ссылку");
+
+  const search = await fetch2gisCard("https://2gis.kz/almaty/search/барбершоп", { fetchImpl: dgis.fake2gisFetch() });
+  assert.match(search.reason, /^в ссылке нет организации/);
+  assert.equal(search.pages.length, 1, "вкладку «Цены» без организации не грузим");
+
+  // 2ГИС поменял устройство страницы: состояния нет — ИИ получает видимый текст, график не подставляем
+  const visible = `<html><head><title>Барбершоп Тест — 2ГИС</title></head><body><h1>Барбершоп Тест</h1><div>${"Мужская стрижка 5 000 ₸. ".repeat(10)}</div></body></html>`;
+  const plain = await fetch2gisCard(dgis.FIRM_URL, { fetchImpl: dgis.fake2gisFetch({ card: visible, prices: "<html></html>" }) });
+  assert.equal(plain.ok, true);
+  assert.match(plain.text, /Мужская стрижка 5 000 ₸/);
+  assert.deepEqual([plain.hours, plain.timezone, plain.checks], [null, null, []]);
+});
+
+test("часовой пояс точки по смещению с карточки: страна, смещение, запасной Etc/GMT", () => {
+  assert.equal(zoneForOffset(300, "Казахстан"), "Asia/Almaty");
+  assert.equal(zoneForOffset(300, "KZ"), "Asia/Almaty");
+  assert.equal(zoneForOffset(300, "Россия"), "Asia/Yekaterinburg");
+  assert.equal(zoneForOffset(180), "Europe/Moscow");
+  assert.equal(zoneForOffset(420, "Россия"), "Asia/Novosibirsk");
+  assert.equal(zoneForOffset(-180), "Etc/GMT+3", "в названиях Etc знак обратный");
+  assert.equal(zoneForOffset(345), null, "не в целых часах и нет в списке");
+  assert.equal(zoneForOffset(undefined), null);
+  // Яндекс: смещение организации в секундах и страна в адресе
+  assert.equal(pageTimezone('{"tzOffset":18000,"compositeAddress":{"country":"Россия","locality":"Пермь"}}'), "Asia/Yekaterinburg");
+  assert.equal(pageTimezone('{"tzOffset":18000,"compositeAddress":{"country":"Казахстан","locality":"Алматы"}}'), "Asia/Almaty");
+  assert.equal(pageTimezone("<html></html>"), null);
+  assert.deepEqual([300, 330, -180, 0].map(fmtUtcOffset), ["UTC+5", "UTC+5:30", "UTC−3", "UTC"]);
+  // Пояс видно в полной карточке точки — в предпросмотре после загрузки
+  assert.match(require("../bot/shop").renderFull(shopFixture({ timezone: "Asia/Almaty" })), /🌍 Часовой пояс: Asia\/Almaty \(UTC\+5\)/);
 });
 
 test("проверка данных точки: без графика и услуг бот работать не сможет, без цен и имён мастеров — сомнительно", () => {

@@ -1,8 +1,9 @@
-// Настройка точки силами ИИ: импорт с Яндекс.Карт и правки словами/скриншотами.
+// Настройка точки силами ИИ: импорт по ссылке на карты (Яндекс.Карты, 2ГИС) и правки словами/скриншотами.
 // Результат всегда — предложение (черновик), мастер подтверждает его кнопкой.
 const { textOf, parseJson, LlmError } = require("./llm");
 const { LLM_SHOP_SCHEMA, toLlmShop, fromLlmShop, emptyShop, normalizeShop, hoursText } = require("./shop");
-const { fetchOrgText, describeFetch, parseOrgId, looksLikeCaptcha } = require("./yandex");
+const { describeFetch } = require("./cards");
+const { mapOf, blockedPage } = require("./maps");
 const { collectChecks } = require("./review");
 
 const SETUP_SYSTEM = `Ты помогаешь мастеру барбершопа (или салона) настроить онлайн-администратора в Telegram. Верни данные точки строго по JSON-схеме.
@@ -10,7 +11,7 @@ const SETUP_SYSTEM = `Ты помогаешь мастеру барбершоп�
 Правила:
 - Ничего не выдумывай. Чего нет в источнике — оставь пустым (при правке — как в текущих данных).
 - Услуги: название; цена как в прайсе («1 800 ₽», «от 2 000 ₽»); длительность в минутах; slots = длительность / slot_minutes с округлением вверх. Обычно услуга занимает от 1 до 4 слотов. Если длительность не указана — поставь типичную для такой услуги и напиши об этом в doubts.
-- График (hours): все 7 дней недели; closed = true — только настоящий выходной. Время в формате HH:MM. «Круглосуточно» — 00:00–24:00, до полуночи — close 24:00. Строка «График работы (из разметки карточки)» — точный график с карточки, бери его. «Открыто до 22:00», «Закрыто до 10:00» — это состояние на момент загрузки страницы, а не график: часы по нему не восстанавливай и в knowledge не переноси. Если графика в источнике нет, у всех дней closed = false, а open и close пустые.
+- График (hours): все 7 дней недели; closed = true — только настоящий выходной. Время в формате HH:MM. «Круглосуточно» — 00:00–24:00, до полуночи — close 24:00. Строка «График работы (из данных карточки)» — точный график с карточки, бери его. «Открыто до 22:00», «Закрыто до 10:00» — это состояние на момент загрузки страницы, а не график: часы по нему не восстанавливай и в knowledge не переноси. Если графика в источнике нет, у всех дней closed = false, а open и close пустые.
 - staff: имена мастеров, если они есть в источнике.
 - knowledge: прочие факты, которые пригодятся в ответах клиентам (оплата, парковка, удобства, правила, акции, особенности). Один факт — одна строка. Не повторяй то, что уже есть в других полях.
 - changes: коротко по-русски, что заполнено или изменено.
@@ -39,7 +40,7 @@ function webFetchLog(content) {
     if (c.type === "web_fetch_tool_result_error") out.push(`${url} → ошибка ${c.error_code}`);
     else {
       const data = typeof c.content?.source?.data === "string" ? c.content.source.data : "";
-      out.push(`${url} → ${looksLikeCaptcha(url, data) ? "капча" : "открыта"}`);
+      out.push(`${url} → ${blockedPage(url, data) || "открыта"}`);
     }
   }
   return out;
@@ -83,38 +84,44 @@ async function safe(fn) {
   }
 }
 
-// Импорт новой точки по ссылке на Яндекс.Карты.
+// Импорт новой точки по ссылке на карточку в Яндекс.Картах или 2ГИС — какие это карты, видно по ссылке (maps.js).
 // Успех: { ok, shop, changes, checks, via, details }; checks — что показать администратору для проверки (review.js).
 // При неудаче: reason — главная причина, details — что произошло на каждом шаге.
 // Это техническая информация для владельца бота, мастеру её не показываем.
-async function importFromYandex({ llm, cfg, url, prevShop, fetchImpl, log = console }) {
-  const base = { ...emptyShop(prevShop), yandexUrl: url };
+async function importFromMap({ llm, cfg, url, prevShop, fetchImpl, log = console }) {
+  const map = mapOf(url);
+  if (!map) return { ok: false, reason: "это не ссылка на карточку в Яндекс.Картах или 2ГИС", details: [] };
+  const base = { ...emptyShop(prevShop), mapUrl: url };
   const details = [];
-  const page = await fetchOrgText(url, { fetchImpl, log });
+  const page = await map.fetch(url, { fetchImpl, log });
   details.push(...page.pages.map(describeFetch));
-  // График из разметки карточки точнее того, что ИИ понял из текста страницы: ставим его поверх
+  // График и часовой пояс из данных карточки точнее того, что ИИ понял из текста страницы: ставим их поверх
   const done = (r, via) => {
     let shop = r.shop;
     if (page.hours) {
       const fromPage = normalizeShop({ ...shop, hours: page.hours }, shop);
       if (hoursText(fromPage) !== hoursText(shop)) {
-        log.info(`Импорт с Яндекс.Карт: график взят из разметки карточки (${hoursText(fromPage)}), у ИИ было: ${hoursText(shop)}`);
+        log.info(`Импорт ${map.from}: график взят из данных карточки (${hoursText(fromPage)}), у ИИ было: ${hoursText(shop)}`);
       }
       shop = fromPage;
+    }
+    if (page.timezone && page.timezone !== shop.timezone) {
+      log.info(`Импорт ${map.from}: часовой пояс по карточке — ${page.timezone} (было ${shop.timezone})`);
+      shop = normalizeShop({ ...shop, timezone: page.timezone }, shop);
     }
     return { ...r, shop, via, details, checks: collectChecks({ shop, notes: page.checks || [], doubts: r.doubts }) };
   };
   let reason = page.reason;
   if (page.ok) {
-    if (!parseOrgId(page.url) && !parseOrgId(url)) {
+    if (!map.orgId(page.url) && !map.orgId(url)) {
       details.push("В ссылке нет номера организации: похоже, это ссылка на карту или поиск, а не на карточку");
     }
     const r = await safe(() =>
       askForShop({
         llm,
         cfg,
-        base: { ...base, yandexUrl: page.url || url },
-        content: `slot_minutes по умолчанию: ${base.slotMinutes}.\nНиже текст страницы организации с Яндекс.Карт (и вкладки «Цены», если она есть). Собери из него данные точки.\n\n${page.text}`,
+        base: { ...base, mapUrl: page.url || url },
+        content: `slot_minutes по умолчанию: ${base.slotMinutes}.\nНиже ${map.page}. Собери из него данные точки.\n\n${page.text}`,
       })
     );
     if (r.ok && r.shop.name) return done(r, "page");
@@ -123,7 +130,7 @@ async function importFromYandex({ llm, cfg, url, prevShop, fetchImpl, log = cons
     reason = `не получилось разобрать карточку (${why})`;
   }
 
-  // Запасной путь: страницу откроет сам ИИ через web_fetch
+  // Запасной путь: страницу откроет сам ИИ через web_fetch (YANDEX_WEB_FETCH — имя с тех пор, когда карты были одни)
   if (cfg.yandexWebFetch) {
     const r = await safe(() =>
       askForShop({
@@ -131,11 +138,11 @@ async function importFromYandex({ llm, cfg, url, prevShop, fetchImpl, log = cons
         cfg,
         base,
         tools: [{ type: "web_fetch_20260209", name: "web_fetch", max_uses: 3 }],
-        content: `slot_minutes по умолчанию: ${base.slotMinutes}.\nОткрой карточку организации на Яндекс.Картах и её вкладку с ценами (обычно адрес карточки + "prices/"), затем собери данные точки. Если страница не открылась или там капча — верни пустые поля.\n\nСсылка: ${url}`,
+        content: `slot_minutes по умолчанию: ${base.slotMinutes}.\n${map.open}, затем собери данные точки. Если страница не открылась или там капча — верни пустые поля.\n\nСсылка: ${url}`,
       })
     );
     if (r.ok && r.shop.name) {
-      log.warn("Импорт с Яндекс.Карт прошёл только через web_fetch:", url, "\n" + details.join("\n"));
+      log.warn(`Импорт ${map.from} прошёл только через web_fetch:`, url, "\n" + details.join("\n"));
       return done(r, "web_fetch");
     }
     const why = r.ok ? "ИИ не получил данных со страницы" : r.reason;
@@ -144,7 +151,7 @@ async function importFromYandex({ llm, cfg, url, prevShop, fetchImpl, log = cons
   } else {
     details.push("Запасной путь (ИИ сам открывает ссылку): выключен (YANDEX_WEB_FETCH=off)");
   }
-  log.warn("Импорт с Яндекс.Карт не удался:", url, "\n" + details.join("\n"));
+  log.warn(`Импорт ${map.from} не удался:`, url, "\n" + details.join("\n"));
   return { ok: false, reason, details };
 }
 
@@ -181,4 +188,4 @@ async function noteFromImages({ llm, cfg, imageList, caption }) {
   });
 }
 
-module.exports = { importFromYandex, updateFromMessage, noteFromImages, SETUP_SYSTEM };
+module.exports = { importFromMap, updateFromMessage, noteFromImages, SETUP_SYSTEM };

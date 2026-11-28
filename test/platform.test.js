@@ -14,6 +14,7 @@ const { startControl } = require("../bot/control");
 const { runCli, parseArgs } = require("../bot/cli");
 const { slugify } = require("../bot/util");
 const { untag, tagMarkup } = require("../bot/telegram");
+const dgis = require("./2gis-pages");
 
 const OWNER = 100;
 const quiet = { info() {}, warn() {}, error() {} };
@@ -269,6 +270,25 @@ test("карточка без графика — владелец видит ❗
   // Администратор по приглашению видит то же самое
   await join(p, inviteIn(text), 300);
   assert.match(lastTo(300), /Данные вашей точки уже загружены[\s\S]*❗ График работы не указан/);
+});
+
+test("/new со ссылкой на 2ГИС — заведение по карточке 2ГИС: свой часовой пояс, что проверить — до ссылок", async () => {
+  const p = await makePlatform();
+  p.fetchImpl = dgis.fake2gisFetch();
+  an.respond = () => final({ ...importedShop, city: "Алматы", address: "проспект Абая, 1" });
+  // Ссылку можно прислать и после /new, отдельным сообщением
+  await says(p, OWNER, "/new");
+  assert.match(lastTo(OWNER), /ссылку на карточку заведения в Яндекс\.Картах или 2ГИС/);
+  await says(p, OWNER, `вот: ${dgis.FIRM_URL}`);
+  await p.idle();
+  assert.ok(texts(OWNER).some((t) => /^⏳ Загружаю карточку из 2ГИС и создаю заведение/.test(t)));
+  const done = texts(OWNER).find((t) => /Заведение создано/.test(t));
+  assert.match(done, /Проверьте, прежде чем отдавать ссылку клиентам<\/b>\n• В карточке перерыв: пн–пт 14:00–15:00/);
+  assert.match(done, /— её можно публиковать:/, "перерыв и ночь — проверить, но не ❗");
+  const app = p.apps.get(p.venueList().at(-1).id);
+  assert.equal(app.shop.timezone, "Asia/Almaty");
+  assert.equal(app.shop.mapUrl, dgis.FIRM_URL);
+  assert.deepEqual(app.shop.hours.sat, ["11:00", "24:00"]);
 });
 
 test("карточка не загрузилась — владелец видит причину и может создать пустое заведение", async () => {
@@ -648,7 +668,7 @@ test("файлы venues/*.json: заведение создаётся при з�
   const rec = p.venueBySlug("borodach");
   assert.ok(rec, "ссылка — по имени файла");
   assert.equal(p.apps.get(rec.id).shop.name, "Барбершоп «Бородач»");
-  assert.equal(p.apps.get(rec.id).shop.yandexUrl, "https://yandex.ru/maps/org/borodach/111/");
+  assert.equal(p.apps.get(rec.id).shop.mapUrl, "https://yandex.ru/maps/org/borodach/111/");
   const note = tg.sentTo(OWNER).find((m) => /Заведение создано/.test(m.params.text));
   assert.match(note.params.text, /файл venues\/borodach\.json/);
   assert.ok(note.params.text.includes("https://t.me/test_bot?start=borodach"));
