@@ -10,6 +10,7 @@ const { Llm } = require("../bot/llm");
 const { App } = require("../bot/app");
 const { typingDuration } = require("../bot/typing");
 const { LLM_SHOP_SCHEMA } = require("../bot/shop");
+const dgis = require("./2gis-pages");
 
 const OWNER = 100;
 const quiet = { info() {}, warn() {}, error() {} };
@@ -1044,7 +1045,7 @@ test("настройка: импорт с Яндекс.Карт → предпр
   assert.equal(app.shop.demo, false);
   assert.equal(app.shop.services.length, 2);
   assert.equal(app.shop.services[0].slots, 2);
-  assert.match(app.shop.yandexUrl, /1234567890/);
+  assert.match(app.shop.mapUrl, /1234567890/);
   assert.equal(app.state.admins[OWNER].mode, null);
 
   // Клиент сразу получает ответы по новой точке
@@ -1078,7 +1079,7 @@ test("настройка: график — из разметки карточк�
   await adminSays(app, "https://yandex.ru/maps/org/barbershop_test/1234567890/");
   await app.idle();
   // ИИ получил график первой строкой
-  assert.match(an.requests[0].body.messages[0].content, /^slot_minutes[^\n]*\n[^\n]*\n\nГрафик работы \(из разметки карточки\): пн–пт: 10:00–21:00; сб: 11:00–20:00; вс: выходной\n/);
+  assert.match(an.requests[0].body.messages[0].content, /^slot_minutes[^\n]*\n[^\n]*\n\nГрафик работы \(из данных карточки\): пн–пт: 10:00–21:00; сб: 11:00–20:00; вс: выходной\n/);
   const preview = tg.sentTo(OWNER).at(-1).params.text;
   assert.match(preview, /🕐 пн–пт: 10:00–21:00; сб: 11:00–20:00; вс: выходной/);
   assert.doesNotMatch(preview, /Обратите внимание/, "проверять нечего: график с карточки, мастер и цены есть");
@@ -1111,6 +1112,57 @@ test("настройка: графика нет ни на карточке, ни
   const prompt = an.requests.at(-1).body.system[0].text;
   assert.match(prompt, /График работы: не указан/);
   assert.doesNotMatch(prompt, /выходной/);
+});
+
+test("настройка: ссылка на 2ГИС вместо Яндекса — та же кнопка; график, прайс и часовой пояс из данных карточки", async () => {
+  const app = await makeApp();
+  app.fetchImpl = dgis.fake2gisFetch();
+  // ИИ, как и с Яндексом, графика в тексте не восстанавливает — график ставит бот из данных карточки
+  const services = [
+    { name: "Мужская стрижка", price: "5 000 ₸", duration_minutes: 60, slots: 2, description: "Мытьё головы и укладка" },
+    { name: "Моделирование бороды", price: "3 000 ₸", duration_minutes: 30, slots: 1, description: "" },
+  ];
+  an.respond = () => final({ ...importedShop, city: "Алматы", address: "проспект Абая, 1", phone: "+7‒700‒000‒11‒22", hours: allClosed, services, doubts: [] });
+  await press(app, "s:yandex");
+  assert.match(tg.sentTo(OWNER).at(-1).params.text, /Пришлите ссылку на вашу точку в Яндекс\.Картах или 2ГИС/);
+  await adminSays(app, "Вот наша точка: https://go.2gis.com/abc");
+  await app.idle();
+  assert.ok(tg.sentTo(OWNER).some((m) => /^⏳ Загружаю карточку из 2ГИС/.test(m.params.text)));
+  assert.equal(an.requests.length, 1);
+  const content = an.requests[0].body.messages[0].content;
+  assert.match(content, /\nНиже данные карточки организации из 2ГИС \(и вкладки «Цены», если она есть\)\. Собери из него данные точки\.\n\nГрафик работы \(из данных карточки\): пн–пт: 10:00–21:00; сб: 11:00–24:00; вс: выходной; перерыв/);
+  assert.match(content, /\nТелефон: \+7‒700‒000‒11‒22\n/);
+  assert.match(content, /- Мужская стрижка — 5 000 ₸\. Мытьё головы и укладка/);
+
+  const preview = tg.sentTo(OWNER).at(-1).params.text;
+  assert.match(preview, /⚠️ <b>Обратите внимание<\/b>\n• В карточке перерыв: пн–пт 14:00–15:00\.[^\n]*\n• По карточке после полуночи работают: сб до 02:00\.[^\n]*\n/);
+  assert.match(preview, /🕐 пн–пт: 10:00–21:00; сб: 11:00–24:00; вс: выходной/);
+  assert.match(preview, /🗺 https:\/\/2gis\.kz\/almaty\/firm\/70000001000000001\n🌍 Часовой пояс: Asia\/Almaty \(UTC\+5\)/);
+  await press(app, "s:save");
+  assert.equal(app.shop.timezone, "Asia/Almaty");
+  assert.equal(app.shop.mapUrl, dgis.FIRM_URL);
+  assert.deepEqual([app.shop.hours.mon, app.shop.hours.sat, app.shop.hours.sun], [["10:00", "21:00"], ["11:00", "24:00"], null]);
+
+  // Клиенту бот считает время по Алматы: 10:00 UTC — это 15:00 там, а не 13:00 по Москве
+  an.respond = () => confident("Здравствуйте!");
+  await clientSays(app, 540, "Привет");
+  await app.idle();
+  const { system } = an.requests.at(-1).body;
+  assert.match(system[0].text, /Карточка на картах: https:\/\/2gis\.kz\/almaty\/firm\/70000001000000001/);
+  assert.match(system[1].text, /Сейчас четверг, чт, 5 ноября, 15:00 по времени точки \(Asia\/Almaty\)/);
+});
+
+test("настройка: 2ГИС показал заглушку «браузер устарел» — просим скриншоты или текст, а владелец видит причину", async () => {
+  const app = await makeApp({ env: { YANDEX_WEB_FETCH: "off" } });
+  app.fetchImpl = async (url) => ({ status: 200, url: `https://2gis.kz/museum?return_url=${encodeURIComponent(url)}`, text: async () => "<html>Ваш браузер устарел</html>" });
+  await press(app, "s:yandex");
+  await adminSays(app, dgis.FIRM_URL);
+  await app.idle();
+  assert.equal(an.requests.length, 0);
+  const msg = tg.sentTo(OWNER).at(-1).params.text;
+  assert.match(msg, /^😕 Не получилось прочитать карточку из 2ГИС\.\n\nПришлите скриншоты карточки и прайса/);
+  assert.match(msg, /Причина:<\/b> 2ГИС показал заглушку «Ваш браузер устарел» вместо карточки/);
+  assert.match(msg, /Карточка: HTTP 200, \d+ Б, итоговый адрес https:\/\/2gis\.kz\/museum[^,]*, заглушка «браузер устарел»/);
 });
 
 test("настройка: если Яндекс показал капчу — просим скриншоты или текст", async () => {

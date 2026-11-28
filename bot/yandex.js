@@ -1,8 +1,8 @@
 // Импорт точки с Яндекс.Карт: скачиваем страницу организации и её прайс,
 // превращаем в текст и отдаём ИИ на разбор (см. setup.js).
 // Яндекс иногда показывает капчу серверам — тогда мастер присылает скриншоты или текст.
-const { WEEKDAY_ORDER, parseTime, fmtTime } = require("./time");
-const { dayGroups, hoursText } = require("./shop");
+const { WEEKDAY_ORDER } = require("./time");
+const { decodeEntities, htmlToText, fetchPage, fetchError, shortUrl, describeFetch, weekSchedule, zoneForOffset } = require("./cards");
 
 // yandex.ru/maps/…, yandex.ru/profile/…, ya.ru/maps/… и старый домен maps.yandex.ru/…
 const YANDEX_URL_RE =
@@ -24,48 +24,6 @@ function parseOrgId(url) {
   return m ? m[1] : null;
 }
 
-const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", mdash: "—", ndash: "–", laquo: "«", raquo: "»", hellip: "…", thinsp: " ", rub: "₽" };
-
-function decodeEntities(s) {
-  return s.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (all, code) => {
-    if (code[0] === "#") {
-      const n = code[1] === "x" || code[1] === "X" ? parseInt(code.slice(2), 16) : parseInt(code.slice(1), 10);
-      return Number.isFinite(n) ? String.fromCodePoint(n) : all;
-    }
-    return ENTITIES[code.toLowerCase()] ?? all;
-  });
-}
-
-// Видимый текст страницы + JSON-LD и meta-описание, без скриптов и стилей.
-function htmlToText(html) {
-  html = String(html || "");
-  const extra = [];
-  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  if (title) extra.push("Заголовок: " + decodeEntities(title[1]).trim());
-  for (const m of html.matchAll(/<meta[^>]+(?:name|property)=["'](?:description|og:title|og:description)["'][^>]*>/gi)) {
-    const c = m[0].match(/content=["']([^"']*)["']/i);
-    if (c) extra.push(decodeEntities(c[1]).trim());
-  }
-  for (const m of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
-    extra.push("JSON-LD: " + m[1].trim().slice(0, 5000));
-  }
-  let body = html
-    .replace(/<(script|style|noscript|svg|template|iframe)[\s\S]*?<\/\1>/gi, " ")
-    .replace(/<!--[\s\S]*?-->/g, " ")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/(p|div|li|h[1-6]|tr|section|article|header|footer)>/gi, "$&\n")
-    .replace(/<[^>]+>/g, " ");
-  body = decodeEntities(body);
-  // Убираем только подряд идущие повторы: одинаковые цены у разных услуг должны остаться
-  const lines = [];
-  for (let line of body.split("\n")) {
-    line = line.replace(/[ \t ]+/g, " ").trim();
-    if (!line || line === lines[lines.length - 1]) continue;
-    lines.push(line);
-  }
-  return [...extra, ...lines].join("\n");
-}
-
 // ---------- график работы из разметки карточки ----------
 // На карточке график свёрнут под кнопкой «График», и в тексте страницы видно только «Открыто до 22:00» —
 // состояние на момент загрузки. ИИ по такому тексту графика не восстановит и ставил все дни выходными.
@@ -75,7 +33,6 @@ function htmlToText(html) {
 // закрытием раньше открытия («Mo 12:00-06:00»). Бывает и общий вид schema.org: «Mo-Fr 10:00-19:00», «Sa,Su …»,
 // «Mo-Su» без времени — круглосуточно.
 const OH_DAY = { mo: "mon", tu: "tue", we: "wed", th: "thu", fr: "fri", sa: "sat", su: "sun" };
-const DAY_MIN = 24 * 60;
 
 function openingHoursValues(html) {
   const out = [];
@@ -104,76 +61,21 @@ function ohDays(spec) {
   return days;
 }
 
-const fmtRange = ([a, b]) => `${fmtTime(a)}–${fmtTime(b)}`;
-
-// Одинаковое по дням — одной строкой: «вт–сб 14:00–15:00», дни без значения пропускаем
-function byDays(valueOf) {
-  return dayGroups(valueOf)
-    .filter((g) => g.value)
-    .map((g) => `${g.label} ${g.value}`)
-    .join(", ");
-}
-
-// → null, если графика в разметке нет; иначе { hours (как shop.hours), line — график словами, notes — что
-// не уложилось в расписание бота: перерывы (у бота на день один промежуток) и работа после полуночи }
+// → null, если графика в разметке нет; иначе { hours, line, notes } — см. weekSchedule в cards.js
 function parseOpeningHours(html) {
-  const spans = {}; // день -> [[открытие, закрытие], …] в минутах
-  const overnight = {}; // день -> до скольки работают после полуночи
-  let found = false;
+  const intervals = [];
   for (const value of openingHoursValues(html)) {
     for (const rule of value.split(";")) {
       const m = rule.trim().match(/^([A-Za-z]{2}(?:\s*[-,]\s*[A-Za-z]{2})*)(?:\s+(.+))?$/);
       const days = m && ohDays(m[1]);
       if (!days) continue;
-      const ranges = [];
       for (const t of (m[2] || "00:00-24:00").split(",")) {
         const r = t.trim().match(/^(\d{1,2}[:.]\d{2})\s*[-–—]\s*(\d{1,2}[:.]\d{2})$/);
-        const open = r && parseTime(r[1]);
-        let close = r && parseTime(r[2]);
-        if (open == null || close == null || open >= DAY_MIN) continue;
-        if (close === 0) close = DAY_MIN;
-        else if (close <= open) {
-          for (const d of days) overnight[d] = Math.max(overnight[d] || 0, close);
-          close = DAY_MIN;
-        }
-        ranges.push([open, close]);
+        if (r) for (const day of days) intervals.push({ day, open: r[1], close: r[2] });
       }
-      if (!ranges.length) continue;
-      found = true;
-      for (const d of days) (spans[d] ||= []).push(...ranges);
     }
   }
-  if (!found) return null;
-
-  const hours = {};
-  const breaks = {};
-  for (const day of WEEKDAY_ORDER) {
-    const list = (spans[day] || []).sort((a, b) => a[0] - b[0]);
-    if (!list.length) {
-      hours[day] = null;
-      continue;
-    }
-    const gaps = [];
-    let end = list[0][1];
-    for (const [open, close] of list.slice(1)) {
-      if (open > end) gaps.push([end, open]);
-      end = Math.max(end, close);
-    }
-    hours[day] = [fmtTime(list[0][0]), fmtTime(end)];
-    if (gaps.length) breaks[day] = gaps.map(fmtRange).join(", ");
-  }
-
-  const notes = [];
-  const pause = byDays((d) => breaks[d] || null);
-  const night = byDays((d) => (overnight[d] ? `до ${fmtTime(overnight[d])}` : null));
-  if (pause) {
-    notes.push({ level: "warn", text: `В карточке перерыв: ${pause}. Перерывов в расписании бота нет, на это время он может записать клиента.` });
-  }
-  if (night) {
-    notes.push({ level: "warn", text: `По карточке после полуночи работают: ${night}. Бот записывает только до 24:00.` });
-  }
-  const line = [hoursText({ hours }), pause && `перерыв ${pause}`, night && `после полуночи ${night}`].filter(Boolean).join("; ");
-  return { hours, line, notes };
+  return weekSchedule(intervals);
 }
 
 // Закрытую организацию Яндекс помечает в заголовке карточки: «Больше не работает: Барбер, барбершоп, …»
@@ -183,6 +85,16 @@ function orgStatusCheck(html) {
     return { level: "error", text: "Яндекс пишет, что организация больше не работает: проверьте, та ли это карточка." };
   }
   return null;
+}
+
+// Часовой пояс точки: в данных страницы Яндекс пишет смещение организации от UTC в секундах
+// («"tzOffset":18000» — Пермь) и страну в адресе («"compositeAddress":{"country":"Россия",…»)
+function pageTimezone(html) {
+  const s = String(html || "");
+  const offset = s.match(/"tzOffset":(-?\d+)/);
+  if (!offset) return null;
+  const country = (s.match(/"compositeAddress":\{[^{}]*?"country":"([^"]+)"/) || [])[1];
+  return zoneForOffset(Number(offset[1]) / 60, country);
 }
 
 function looksLikeCaptcha(url, html) {
@@ -196,48 +108,18 @@ const HEADERS = {
   accept: "text/html,application/xhtml+xml",
 };
 
-async function fetchPage(url, fetchImpl, timeoutMs) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetchImpl(url, { headers: HEADERS, redirect: "follow", signal: ctrl.signal });
-    const html = await res.text();
-    return { status: res.status, url: res.url || url, html };
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-// «fetch failed» сам по себе ничего не говорит: настоящая причина (DNS, отказ в соединении,
-// сертификат) лежит в e.cause
-function fetchError(e) {
-  if (e?.name === "AbortError") return "таймаут";
-  const cause = e?.cause?.code || e?.cause?.message;
-  return cause && cause !== e.message ? `${e.message}: ${cause}` : String(e?.message || e);
-}
-
-const shortUrl = (u, max = 200) => (u.length > max ? u.slice(0, max) + "…" : u);
-
-// Одна строка о запросе к Яндексу: для логов и для владельца бота
-function describeFetch(p) {
-  if (p.error) return `${p.what}: ${p.error}`;
-  const parts = [`HTTP ${p.status}`, p.bytes < 1024 ? `${p.bytes} Б` : `${Math.round(p.bytes / 1024)} КБ`];
-  if (p.finalUrl && p.finalUrl !== p.url) parts.push(`итоговый адрес ${shortUrl(p.finalUrl)}`);
-  if (p.captcha) parts.push("капча");
-  return `${p.what}: ${parts.join(", ")}`;
-}
-
-// → { ok: true, text, url, orgId, pages, hours, checks } | { ok: false, reason, pages }
+// → { ok: true, text, url, orgId, pages, hours, checks, timezone } | { ok: false, reason, pages }
 // pages — что Яндекс ответил на каждый запрос (статус, итоговый адрес после редиректов, капча);
 // hours — график из разметки карточки (как shop.hours) или null; checks — что показать администратору
-// для проверки: перерывы и работа после полуночи из графика, «больше не работает» (см. review.js)
+// для проверки: перерывы и работа после полуночи из графика, «больше не работает» (см. review.js);
+// timezone — часовой пояс точки по карточке или null
 async function fetchOrgText(url, { fetchImpl = fetch, timeoutMs = 15000, maxChars = 60000, log } = {}) {
   const pages = [];
   const get = async (what, pageUrl) => {
     const p = { what, url: pageUrl };
     let html = "";
     try {
-      const r = await fetchPage(pageUrl, fetchImpl, timeoutMs);
+      const r = await fetchPage(pageUrl, { fetchImpl, timeoutMs, headers: HEADERS });
       html = r.html;
       Object.assign(p, { status: r.status, finalUrl: r.url, bytes: Buffer.byteLength(html), captcha: looksLikeCaptcha(r.url, html) });
     } catch (e) {
@@ -271,9 +153,9 @@ async function fetchOrgText(url, { fetchImpl = fetch, timeoutMs = 15000, maxChar
   // График — первой строкой: её видит ИИ (и не обрежет maxChars), а hours подставит в данные точки setup.js
   const schedule = parseOpeningHours(html);
   log?.info?.(`Яндекс.Карты: график в разметке карточки — ${schedule ? schedule.line : "не найден"}`);
-  if (schedule) text = `График работы (из разметки карточки): ${schedule.line}\n${text}`;
+  if (schedule) text = `График работы (из данных карточки): ${schedule.line}\n${text}`;
   const checks = [orgStatusCheck(html), ...(schedule?.notes || [])].filter(Boolean);
-  return { ok: true, text: text.slice(0, maxChars), url: main.finalUrl, orgId, pages, hours: schedule?.hours || null, checks };
+  return { ok: true, text: text.slice(0, maxChars), url: main.finalUrl, orgId, pages, hours: schedule?.hours || null, checks, timezone: pageTimezone(html) };
 }
 
-module.exports = { extractYandexUrl, parseOrgId, htmlToText, fetchOrgText, looksLikeCaptcha, describeFetch, parseOpeningHours, orgStatusCheck };
+module.exports = { extractYandexUrl, parseOrgId, fetchOrgText, looksLikeCaptcha, parseOpeningHours, orgStatusCheck, pageTimezone };

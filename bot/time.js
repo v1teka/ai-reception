@@ -130,6 +130,24 @@ function minutesUntil(date, minutes, timeZone, now = Date.now()) {
   return diffDays(date, cur.date) * 1440 + minutes - cur.minutes;
 }
 
+// Смещение часового пояса от UTC в минутах в момент now (Москва — 180); null — такого пояса нет
+function zoneOffset(timeZone, now = Date.now()) {
+  try {
+    const local = nowParts(timeZone, now);
+    const utc = nowParts("UTC", now);
+    return diffDays(local.date, utc.date) * 1440 + local.minutes - utc.minutes;
+  } catch {
+    return null;
+  }
+}
+
+// "UTC+5", "UTC+5:30", "UTC−3", "UTC"
+function fmtUtcOffset(minutes) {
+  if (!minutes) return "UTC";
+  const a = Math.abs(minutes);
+  return `UTC${minutes > 0 ? "+" : "−"}${Math.floor(a / 60)}${a % 60 ? `:${pad(a % 60)}` : ""}`;
+}
+
 // "5 мин назад", "2 ч назад", "вчера"
 function ago(ts, now = Date.now()) {
   const min = Math.max(0, Math.round((now - ts) / 60000));
@@ -157,5 +175,7 @@ module.exports = {
   fmtDateRelative,
   fmtDuration,
   minutesUntil,
+  zoneOffset,
+  fmtUtcOffset,
   ago,
 };

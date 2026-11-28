@@ -12,7 +12,7 @@ const { App, ADMIN_COMMANDS } = require("./app");
 const { Store } = require("./store");
 const { TelegramApi, TaggedApi, Poller, untag } = require("./telegram");
 const { normalizeShop, emptyShop, fromLlmShop } = require("./shop");
-const { importFromYandex } = require("./setup");
+const { importFromMap } = require("./setup");
 const { collectChecks, reviewShop } = require("./review");
 const { esc, plain, truncate, randomCode, slugify, sleep: realSleep } = require("./util");
 
@@ -55,7 +55,7 @@ function normalizePlatform(state, raw) {
   return state;
 }
 
-// Данные заведения в формате импорта с Яндекс.Карт (LLM_SHOP_SCHEMA) плюс необязательные slug, source, timezone,
+// Данные заведения в формате импорта с карт (LLM_SHOP_SCHEMA) плюс необязательные slug, source, timezone,
 // demo_busy и notes: так их пишет Claude в venues/<slug>.json и так их принимает `node bot/cli.js add <файл>`.
 // → { shop, slug, checks } или исключение с понятной причиной. checks — что проверить (review.js): пометки
 // из файла (notes, doubts, changes) и проверки самих данных — нет графика, услуг, цен, имён мастеров.
@@ -65,7 +65,7 @@ function parseVenueData(obj, { file = "" } = {}) {
   if (!String(obj.name || "").trim()) throw new Error(`Нет названия заведения (name)${where}`);
   if (obj.services != null && !Array.isArray(obj.services)) throw new Error(`services — не список${where}`);
   if (obj.slug != null && !SLUG_RE.test(obj.slug)) throw new Error(`slug «${obj.slug}»: только латиница в нижнем регистре, цифры и дефис, 2–40 символов${where}`);
-  const base = { ...emptyShop(), yandexUrl: String(obj.source || obj.yandexUrl || "") };
+  const base = { ...emptyShop(), mapUrl: String(obj.source || obj.mapUrl || obj.yandexUrl || "") };
   if (obj.timezone != null) {
     const tz = String(obj.timezone).trim();
     try {
@@ -407,10 +407,10 @@ class Platform {
     return { rec, app };
   }
 
-  // Заведение по карточке с Яндекс.Карт: та же загрузка и разбор, что в «Настройках точки»
+  // Заведение по карточке в Яндекс.Картах или 2ГИС: та же загрузка и разбор, что в «Настройках точки»
   async importVenue({ url, by = null, slug = null }) {
     if (slug) this.checkSlug(slug);
-    const r = await importFromYandex({ llm: this.llm, cfg: this.cfg, url, prevShop: null, fetchImpl: this.fetchImpl, log: this.log });
+    const r = await importFromMap({ llm: this.llm, cfg: this.cfg, url, prevShop: null, fetchImpl: this.fetchImpl, log: this.log });
     if (!r.ok) return r;
     const { rec, app } = await this.createVenue({ shop: r.shop, slug, by });
     return { ok: true, rec, app, changes: r.changes || [], checks: r.checks || [], via: r.via };
@@ -566,7 +566,7 @@ class Platform {
     return this.sendHtml(
       api,
       user.id,
-      "👑 Готово, вы владелец бота.\n\nЗдесь можно создавать заведения: пришлите <code>/new</code> и ссылку на карточку в Яндекс.Картах — бот загрузит данные и даст ссылки для клиентов и администратора.",
+      "👑 Готово, вы владелец бота.\n\nЗдесь можно создавать заведения: пришлите <code>/new</code> и ссылку на карточку в Яндекс.Картах или 2ГИС — бот загрузит данные и даст ссылки для клиентов и администратора.",
       [[this.btn("➕ Новое заведение", "new")], [this.btn("🏪 Заведения", "list")]]
     );
   }
