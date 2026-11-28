@@ -13,6 +13,7 @@ const { Store } = require("./store");
 const { TelegramApi, TaggedApi, Poller, untag } = require("./telegram");
 const { normalizeShop, emptyShop, fromLlmShop } = require("./shop");
 const { importFromYandex } = require("./setup");
+const { collectChecks, reviewShop } = require("./review");
 const { esc, plain, truncate, randomCode, slugify, sleep: realSleep } = require("./util");
 
 const DAY = 86400000;
@@ -56,7 +57,8 @@ function normalizePlatform(state, raw) {
 
 // Данные заведения в формате импорта с Яндекс.Карт (LLM_SHOP_SCHEMA) плюс необязательные slug, source, timezone,
 // demo_busy и notes: так их пишет Claude в venues/<slug>.json и так их принимает `node bot/cli.js add <файл>`.
-// → { shop, slug, notes } или исключение с понятной причиной.
+// → { shop, slug, checks } или исключение с понятной причиной. checks — что проверить (review.js): пометки
+// из файла (notes, doubts, changes) и проверки самих данных — нет графика, услуг, цен, имён мастеров.
 function parseVenueData(obj, { file = "" } = {}) {
   const where = file ? ` (${file})` : "";
   if (!obj || typeof obj !== "object" || Array.isArray(obj)) throw new Error(`Данные заведения — не объект JSON${where}`);
@@ -75,9 +77,8 @@ function parseVenueData(obj, { file = "" } = {}) {
   }
   if (obj.demo_busy != null) base.demoBusy = Boolean(obj.demo_busy);
   const shop = fromLlmShop({ ...obj, services: obj.services || [], knowledge: obj.knowledge || [], hours: obj.hours || [] }, base);
-  const notes = [...(Array.isArray(obj.changes) ? obj.changes : []), ...(Array.isArray(obj.notes) ? obj.notes : [])].map(String);
-  if (!shop.services.length) notes.push("В данных нет ни одной услуги — записывать клиентов будет не на что");
-  return { shop, slug: obj.slug || null, notes };
+  const marks = ["changes", "notes", "doubts"].flatMap((k) => (Array.isArray(obj[k]) ? obj[k] : [])).map(String);
+  return { shop, slug: obj.slug || null, checks: collectChecks({ shop, doubts: marks }) };
 }
 
 // Ссылка заведения из файла venues/<имя>.json: slug из файла или само имя файла (borodach.json → ?start=borodach).
@@ -412,7 +413,7 @@ class Platform {
     const r = await importFromYandex({ llm: this.llm, cfg: this.cfg, url, prevShop: null, fetchImpl: this.fetchImpl, log: this.log });
     if (!r.ok) return r;
     const { rec, app } = await this.createVenue({ shop: r.shop, slug, by });
-    return { ok: true, rec, app, changes: r.changes || [], via: r.via };
+    return { ok: true, rec, app, changes: r.changes || [], checks: r.checks || [], via: r.via };
   }
 
   // Заведения из папки venues/ репозитория: их готовит Claude по карточке (см. CLAUDE.md), и они приезжают
@@ -431,7 +432,7 @@ class Platform {
         const { rec, app } = await this.createVenue({ shop: seed.shop, slug, by: "seed" });
         this.state.seeded[key] = { at: this.now(), venue: rec.id };
         this.save();
-        await this.announceVenue(rec, app, { notes: seed.notes, via: `файл venues/${f}` });
+        await this.announceVenue(rec, app, { checks: seed.checks, via: `файл venues/${f}` });
       } catch (e) {
         this.log.error(`Заведение из venues/${f} не создано:`, e.message);
       }
@@ -503,11 +504,14 @@ class Platform {
   async sendVenueLinks(app, uid) {
     const rec = this.state.venues[app.venueId];
     if (!rec) return;
+    // Что проверить, только что показали в предпросмотре — здесь лишь то, без чего бот не работает
+    const checks = reviewShop(app.shop).filter((c) => c.level === "error");
     if (this.isOwner(uid)) {
       const invite = this.adminInvite(rec.id, uid);
-      return this.sendHtml(this.uiApi("console"), uid, this.createdText(rec, app, { invite, title: "Заведение готово" }), this.createdKeyboard(rec));
+      return this.sendHtml(this.uiApi("console"), uid, this.createdText(rec, app, { checks, invite, title: "Заведение готово" }), this.createdKeyboard(rec));
     }
-    return app.sendHtml(uid, `🔗 <b>Ссылка для клиентов</b> — её можно публиковать:\n${esc(this.clientLink(rec))}`);
+    const when = checks.length ? "опубликуйте её, когда поправите то, что отмечено ❗ в настройках" : "её можно публиковать";
+    return app.sendHtml(uid, `🔗 <b>Ссылка для клиентов</b> — ${when}:\n${esc(this.clientLink(rec))}`);
   }
 
   // Сводка заведения для CLI и списков

@@ -54,7 +54,8 @@ const importedShop = {
     { name: "Борода", price: "900 ₽", duration_minutes: 30, slots: 1, description: "" },
   ],
   knowledge: ["Оплата картой и наличными"],
-  changes: ["Мастер в карточке не указан — проверьте имя"],
+  changes: ["Заполнено по карточке"],
+  doubts: ["Мастер в карточке не указан — проверьте имя"],
 };
 
 // Данные заведения так, как их кладёт в venues/<slug>.json Claude (формат импорта с Яндекс.Карт)
@@ -250,6 +251,24 @@ test("владелец присылает карточку с Яндекс.Ка�
   assert.match(lastTo(501), /Это Барбершоп Тест/);
   assert.ok(texts(502).some((t) => /Это Демо-барбершоп «Бритва»/.test(t)));
   assert.equal(p.userVenue(502), "v1");
+});
+
+test("карточка без графика — владелец видит ❗ до ссылок, а ссылку для клиентов публикуют после правки", async () => {
+  const p = await makePlatform();
+  const allClosed = importedShop.hours.map((h) => ({ ...h, closed: true, open: "", close: "" }));
+  const { done } = await createByUrl(p, { ...importedShop, hours: allClosed });
+  const text = done.text;
+  assert.ok(
+    text.indexOf("❗ График работы не указан") < text.indexOf("<b>Барбершоп Тест</b>"),
+    "что проверить — до данных и ссылок"
+  );
+  assert.match(text, /⚠️ <b>Проверьте, прежде чем отдавать ссылку клиентам<\/b>\n❗ График работы не указан[^\n]*\n• Мастер в карточке не указан — проверьте имя/);
+  assert.match(text, /Ссылка для клиентов<\/b> — опубликуйте её, когда поправите то, что отмечено ❗:/);
+  assert.doesNotMatch(text, /её можно публиковать/);
+
+  // Администратор по приглашению видит то же самое
+  await join(p, inviteIn(text), 300);
+  assert.match(lastTo(300), /Данные вашей точки уже загружены[\s\S]*❗ График работы не указан/);
 });
 
 test("карточка не загрузилась — владелец видит причину и может создать пустое заведение", async () => {
@@ -776,10 +795,19 @@ test("данные заведения из файла: понятные ошиб
   assert.throws(() => parseVenueData([]), /не объект/);
   assert.throws(() => parseVenueData({ services: [] }), /Нет названия/);
   assert.throws(() => parseVenueData({ name: "X", slug: "Bad Slug" }), /slug/);
-  const { shop, notes } = parseVenueData({ name: "Пустой" });
+  const { shop, checks } = parseVenueData({ name: "Пустой", notes: ["Телефон с сайта, в карточке другой"] });
   assert.equal(shop.name, "Пустой");
   assert.equal(shop.demo, false);
-  assert.match(notes.join(), /нет ни одной услуги/);
+  // Сначала то, без чего бот не работает, потом сомнения — и пометки из файла
+  assert.deepEqual(
+    checks.map((c) => [c.level, c.text.split(/[:—]/)[0].trim()]),
+    [
+      ["error", "График работы не указан"],
+      ["error", "Нет ни одной услуги"],
+      ["warn", "Имена мастеров не указаны"],
+      ["warn", "Телефон с сайта, в карточке другой"],
+    ]
+  );
 });
 
 test("пометка заведения в кнопках: дописывается один раз и снимается", () => {

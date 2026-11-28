@@ -1005,8 +1005,20 @@ const importedShop = {
     { name: "Борода", price: "900 ₽", duration_minutes: 30, slots: 1, description: "" },
   ],
   knowledge: ["Оплата картой и наличными"],
-  changes: ["Мастер в карточке не указан — проверьте имя"],
+  changes: ["Заполнено по карточке"],
+  doubts: ["Мастер в карточке не указан — проверьте имя"],
 };
+
+// Настоящая карточка Яндекса: график свёрнут под «График», в тексте — только «Открыто до 22:00»,
+// а сам график — в разметке schema.org, по тегу на рабочий день (воскресенья нет — выходной)
+const YANDEX_CARD = (hours = ["Mo-Fr 10:00-21:00", "Sa 11:00-20:00"]) =>
+  `<html><head><title>Барбершоп Тест, барбершоп, Казань, ул. Ленина, 5 — Яндекс Карты</title></head><body>
+<div itemscope="" itemType="http://schema.org/LocalBusiness"><h1 itemProp="name">Барбершоп Тест</h1><div>Ул. Ленина, 5, Казань</div>
+<div class="business-card-working-status-view__text" title="Открыто до 22:00">Открыто до 22:00</div><div class="card-feature-view__value">График</div>
+${hours.map((h) => `<meta itemProp="openingHours" content="${h}"/>`).join("")}<div>+7 (843) 000-11-22</div><div>Оплата картой и наличными</div></div></body></html>`;
+const yandexCardFetch = (html) => async (url) => ({ status: 200, url, text: async () => (/prices/.test(url) ? PRICES_HTML : html) });
+// ИИ видит на карточке только «Открыто до 22:00»: графика не знает и ставит все дни выходными
+const allClosed = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"].map((day) => ({ day, closed: true, open: "", close: "" }));
 
 test("настройка: импорт с Яндекс.Карт → предпросмотр → сохранить; правка словами", async () => {
   const app = await makeApp();
@@ -1056,6 +1068,49 @@ test("настройка: импорт с Яндекс.Карт → предпр
   await press(app, "s:save");
   assert.equal(app.shop.hours.sun, null);
   assert.deepEqual(app.shop.hours.sat, ["10:00", "20:00"]);
+});
+
+test("настройка: график — из разметки карточки, даже если ИИ по «Открыто до 22:00» поставил все дни выходными", async () => {
+  const app = await makeApp();
+  app.fetchImpl = yandexCardFetch(YANDEX_CARD());
+  an.respond = () => final({ ...importedShop, hours: allClosed, doubts: [] });
+  await press(app, "s:yandex");
+  await adminSays(app, "https://yandex.ru/maps/org/barbershop_test/1234567890/");
+  await app.idle();
+  // ИИ получил график первой строкой
+  assert.match(an.requests[0].body.messages[0].content, /^slot_minutes[^\n]*\n[^\n]*\n\nГрафик работы \(из разметки карточки\): пн–пт: 10:00–21:00; сб: 11:00–20:00; вс: выходной\n/);
+  const preview = tg.sentTo(OWNER).at(-1).params.text;
+  assert.match(preview, /🕐 пн–пт: 10:00–21:00; сб: 11:00–20:00; вс: выходной/);
+  assert.doesNotMatch(preview, /Обратите внимание/, "проверять нечего: график с карточки, мастер и цены есть");
+  await press(app, "s:save");
+  assert.deepEqual(app.shop.hours.mon, ["10:00", "21:00"]);
+  assert.deepEqual(app.shop.hours.sat, ["11:00", "20:00"]);
+  assert.equal(app.shop.hours.sun, null);
+});
+
+test("настройка: графика нет ни на карточке, ни у ИИ — бот просит его до сохранения, а клиенту не говорит «выходной»", async () => {
+  const app = await makeApp();
+  app.fetchImpl = yandexCardFetch(YANDEX_CARD([]));
+  an.respond = () =>
+    final({ ...importedShop, hours: allClosed, changes: ["Заполнено по карточке"], doubts: ["Длительность бороды в прайсе не указана — поставил 30 минут"] });
+  await press(app, "s:yandex");
+  await adminSays(app, "https://yandex.ru/maps/org/barbershop_test/1234567890/");
+  await app.idle();
+  const preview = tg.sentTo(OWNER).at(-1).params.text;
+  // Что проверить — сверху, до данных точки: сначала то, без чего бот не работает, потом сомнения ИИ
+  assert.match(preview, /Проверьте, что получилось<\/b>\n\n⚠️ <b>Обратите внимание<\/b>\n❗ График работы не указан[^\n]*\n• Длительность бороды в прайсе не указана — поставил 30 минут\n\n<b>Барбершоп Тест<\/b>/);
+  assert.match(preview, /🕐 График не указан/);
+  assert.match(preview, /📝 <b>Что сделано<\/b>\n• Заполнено по карточке/);
+
+  // Сохранили как есть — в настройках напоминание, клиенту бот часы не выдумывает
+  await press(app, "s:save");
+  assert.match(tg.sentTo(OWNER).at(-1).params.text, /Настройки точки[\s\S]*❗ График работы не указан/);
+  an.respond = () => final({ reply: "", confidence: 0.9, handoff: true, handoff_reason: "нет графика", hold: "Уточню у мастера и скоро отвечу" });
+  await clientSays(app, 530, "Вы завтра работаете?");
+  await app.idle();
+  const prompt = an.requests.at(-1).body.system[0].text;
+  assert.match(prompt, /График работы: не указан/);
+  assert.doesNotMatch(prompt, /выходной/);
 });
 
 test("настройка: если Яндекс показал капчу — просим скриншоты или текст", async () => {

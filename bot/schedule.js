@@ -13,8 +13,11 @@ const {
   fmtDuration,
   minutesUntil,
 } = require("./time");
-const { findService, findStaff } = require("./shop");
+const { findService, findStaff, hoursKnown } = require("./shop");
 const { seededRandom, clamp } = require("./util");
+
+// Без единого рабочего дня график не известен (см. hoursKnown): свободного времени бот не знает и не выдумывает
+const NO_HOURS = "График работы точки не указан, свободного времени в данных нет. Не называй клиенту время: скажи, что уточнишь, и позови мастера.";
 
 function dayHours(shop, date) {
   const h = shop.hours[weekdayOf(date)];
@@ -78,6 +81,7 @@ function freeStarts(state, shop, { date, staffId, slots, now = Date.now() }) {
 function findFreeSlots(state, shop, { serviceId, dateFrom, days, staffId, now = Date.now(), maxPerDay = 14 }) {
   const service = findService(shop, serviceId);
   if (!service) return { error: `Нет услуги с id «${serviceId}». Возьми id из списка услуг.` };
+  if (!hoursKnown(shop)) return { error: NO_HOURS };
   let staffList = shop.staff;
   if (staffId) {
     const st = findStaff(shop, staffId);
@@ -130,6 +134,7 @@ function nextBookingId(state) {
 function createBooking(state, shop, { serviceId, date, time, staffId, client, comment, now = Date.now(), source = "bot" }) {
   const service = findService(shop, serviceId);
   if (!service) return { ok: false, error: `Нет услуги «${serviceId}».` };
+  if (!hoursKnown(shop)) return { ok: false, error: NO_HOURS };
   if (!isDate(date)) return { ok: false, error: "Дата должна быть в формате YYYY-MM-DD." };
   const start = parseTime(time);
   if (start == null) return { ok: false, error: "Время должно быть в формате HH:MM." };

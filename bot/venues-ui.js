@@ -3,6 +3,7 @@
 const { App } = require("./app");
 const { renderSummary, emptyShop } = require("./shop");
 const { extractYandexUrl } = require("./yandex");
+const { checkLines, hasErrors } = require("./review");
 const { esc, truncate } = require("./util");
 
 const TOKEN_RE = /\d{5,}:[A-Za-z0-9_-]{30,}/;
@@ -127,7 +128,7 @@ const methods = {
       );
     }
     this.enter(uid, r.rec.id);
-    return this.sendCreated(uid, r.rec, r.app, { notes: r.changes, api });
+    return this.sendCreated(uid, r.rec, r.app, { checks: r.checks, api });
   },
 
   // Пустое заведение: данные владелец присылает в его настройку точки — словами или скриншотами.
@@ -144,18 +145,23 @@ const methods = {
     );
   },
 
-  // Текст «заведение готово»: что загружено, ссылки для клиентов и одноразовая — для администратора
-  createdText(rec, app, { notes = [], invite, via = "", title = "Заведение создано" } = {}) {
-    const lines = [`✅ <b>${esc(title)}</b>${via ? ` <i>(${esc(via)})</i>` : ""}`, "", renderSummary(app.shop), ""];
-    lines.push("🔗 <b>Ссылка для клиентов</b> — её можно публиковать:", esc(this.clientLink(rec)), "");
+  // Текст «заведение готово»: что проверить, что загружено, ссылки для клиентов и одноразовая — для администратора.
+  // checks — что бот просит проверить (review.js), сверху: ссылку клиентам отдают после этого
+  createdText(rec, app, { checks = [], invite, via = "", title = "Заведение создано" } = {}) {
+    const lines = [`✅ <b>${esc(title)}</b>${via ? ` <i>(${esc(via)})</i>` : ""}`, ""];
+    if (checks.length) lines.push("⚠️ <b>Проверьте, прежде чем отдавать ссылку клиентам</b>", ...checkLines(checks.slice(0, 12)), "");
+    lines.push(renderSummary(app.shop), "");
+    lines.push(
+      hasErrors(checks)
+        ? "🔗 <b>Ссылка для клиентов</b> — опубликуйте её, когда поправите то, что отмечено ❗:"
+        : "🔗 <b>Ссылка для клиентов</b> — её можно публиковать:",
+      esc(this.clientLink(rec)),
+      ""
+    );
     lines.push(
       "👤 <b>Ссылка для администратора</b> — одноразовая, действует 7 дней. Перешлите её представителю заведения: по ней он станет администратором и сразу увидит данные своей точки.",
       esc(invite)
     );
-    if (notes.length) {
-      lines.push("", "<b>Проверьте</b>");
-      for (const n of notes.slice(0, 10)) lines.push(`• ${esc(truncate(n, 300))}`);
-    }
     return lines.join("\n");
   },
 
@@ -166,16 +172,16 @@ const methods = {
     ];
   },
 
-  async sendCreated(uid, rec, app, { notes = [], api = this.shared } = {}) {
+  async sendCreated(uid, rec, app, { checks = [], api = this.shared } = {}) {
     const invite = this.adminInvite(rec.id, uid);
-    return this.sendHtml(api, uid, this.createdText(rec, app, { notes, invite }), this.createdKeyboard(rec));
+    return this.sendHtml(api, uid, this.createdText(rec, app, { checks, invite }), this.createdKeyboard(rec));
   },
 
   // Заведение создали не в чате с владельцем (командой на сервере или файлом из venues/) — ссылки приходят владельцам
-  async announceVenue(rec, app, { notes = [], via = "", invite = null } = {}) {
+  async announceVenue(rec, app, { checks = [], via = "", invite = null } = {}) {
     if (!this.ownerIds().length) return;
     invite ||= this.adminInvite(rec.id, null);
-    return this.notifyOwners(this.createdText(rec, app, { notes, invite, via }), this.createdKeyboard(rec));
+    return this.notifyOwners(this.createdText(rec, app, { checks, invite, via }), this.createdKeyboard(rec));
   },
 
   // ---------- списки и карточка заведения ----------

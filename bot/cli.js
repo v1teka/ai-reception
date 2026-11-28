@@ -105,6 +105,7 @@ function request(file, msg, timeoutMs) {
 function check(file) {
   const { readVenueFile, seedSlug } = require("./platform");
   const { renderFull } = require("./shop");
+  const { checkLines } = require("./review");
   const { plain } = require("./util");
   if (!file) throw new Error("Укажите файл: check venues/<ссылка>.json");
   const seed = readVenueFile(file);
@@ -115,9 +116,9 @@ function check(file) {
     plain(renderFull(seed.shop)),
     "",
     `Ссылка для клиентов: ${slug ? `t.me/<бот>?start=${slug}` : "придумается по названию (имя файла для ссылки не подходит)"}`,
-    ...(seed.notes.length ? ["", "Проверьте:", ...seed.notes.map((n) => `• ${n}`)] : []),
+    ...(seed.checks.length ? ["", "Проверьте:", ...checkLines(seed.checks, { html: false })] : []),
   ];
-  return { result: { slug, shop: seed.shop, notes: seed.notes }, text: text.join("\n") };
+  return { result: { slug, shop: seed.shop, checks: seed.checks, notes: seed.checks.map((c) => c.text) }, text: text.join("\n") };
 }
 
 // → код выхода. Тесты зовут её напрямую, со своими env и потоками.
